@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  spark-history-server:
+    image: bitnami/spark:3.3.0
+    container_name: spark-history-server
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./spark-events:/tmp/spark-events
+      - ./spark-uimeta:/tmp/spark-uimeta
+      - ./target/spark-uiservice-1.0-SNAPSHOT.jar:/opt/bitnami/spark/jars/spark-uiservice-1.0-SNAPSHOT.jar
+    command: >
+      /opt/bitnami/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+      --properties-file /dev/null
+      --conf spark.history.fs.logDirectory=/tmp/spark-events
+      --conf spark.history.provider=org.apache.spark.history.uimeta.UIMetaProvider
+      --conf spark.uimeta.dir=/tmp/spark-uimeta
