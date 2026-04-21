@@ -1,0 +1,100 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(50, 85, 255, 0.12), transparent 28%),
+    linear-gradient(180deg, #f6f8ff 0%, #eef2ff 100%);
+  color: #172033;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100vh;
+}
+
+button {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 48px 20px;
+  display: grid;
+  place-items: center;
+}
+
+.hero,
+.panel {
+  width: min(720px, 100%);
+}
+
+.hero {
+  margin-bottom: 20px;
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-size: 0.75rem;
+  color: #5a6785;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(2.5rem, 5vw, 4.5rem);
+  line-height: 0.95;
+}
+
+.subtitle {
+  max-width: 56ch;
+  margin: 16px 0 0;
+  font-size: 1.05rem;
+  line-height: 1.6;
+  color: #41506c;
+}
+
+.panel {
+  padding: 20px;
+  border: 1px solid rgba(82, 98, 142, 0.16);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.76);
+  box-shadow: 0 20px 60px rgba(32, 47, 90, 0.08);
+  backdrop-filter: blur(16px);
+}
+
+.tab-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.tab {
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 18px;
+  background: #dbe5ff;
+  color: #20325d;
+  cursor: pointer;
+}
+
+.tab.active {
+  background: #1e3a8a;
+  color: white;
+}
+
+.hint {
+  margin: 16px 0 0;
+  color: #374867;
+  font-weight: 600;
+}
