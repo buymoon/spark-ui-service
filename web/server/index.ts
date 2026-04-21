@@ -1,6 +1,11 @@
+import path from "node:path";
+import { createApp } from "./app";
+
 const port = Number(process.env.PORT ?? 3000);
+const workspaceRoot = process.env.WORKSPACE_ROOT ?? path.resolve(process.cwd(), ".local-runs");
 
-console.log(`spark-ui-service web dev server placeholder listening on ${port}`);
+const app = createApp({ workspaceRoot });
 
-// Keep the placeholder process alive for `tsx watch` during local development.
-setInterval(() => {}, 1 << 30);
+app.listen(port, () => {
+  console.log(`spark-ui-service web dev server listening on ${port}`);
+});
