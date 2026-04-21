@@ -18,4 +18,8 @@ export interface TaskResponse extends TaskSummary {
   outputMode: "managed" | "custom";
 }
 
+export interface TaskDetailResponse extends TaskResponse {
+  uploadedFileName?: string;
+}
+
 export type { TaskInputMode, TaskStatus };

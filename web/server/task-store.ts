@@ -47,6 +47,10 @@ export class TaskStore {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
+  get(taskId: string): TaskRecord | undefined {
+    return this.readTask(taskId);
+  }
+
   private readTask(taskId: string): TaskRecord | undefined {
     const taskPath = taskFile(this.workspaceRoot, taskId, "task.json");
     if (!fs.existsSync(taskPath)) {
