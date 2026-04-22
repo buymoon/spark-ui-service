@@ -109,6 +109,54 @@ The packaged JAR is generated at `target/spark-uiservice-1.0-SNAPSHOT.jar`.
 mvn test
 ```
 
+## Local Web Tool
+
+The repository now includes a local single-machine web workflow under `web/` for:
+
+- creating a task from an uploaded eventlog or a local absolute path
+- preprocessing a large Spark eventlog into a reusable `.uimeta`
+- launching a task-scoped Spark History Server
+- reopening the native Spark History UI without replaying the eventlog every time
+
+### Start the local backend
+
+Make sure `SPARK_HOME` points at a Spark 3.3 runtime and that the project jar has been built:
+
+```bash
+./apache-maven-3.9.5/bin/mvn -DskipTests package
+cd web
+SPARK_HOME=/opt/spark npm run dev:server
+```
+
+The backend listens on port `3000` by default.
+
+### Start the frontend
+
+In a second terminal:
+
+```bash
+cd web
+npm run dev:client
+```
+
+Open the Vite URL in your browser, create a task, and then use the generated “Open Spark UI” action to jump into the native History Server page.
+
+### Run the 1 GB local web flow
+
+After the backend is running, you can drive the path-mode API end-to-end with:
+
+```bash
+bash scripts/run_1gb_web_e2e.sh
+```
+
+The script will:
+
+- build the project jar
+- generate an open-source Spark eventlog targeting `1 GB`
+- submit that eventlog to the local web backend in path mode
+- poll until the task becomes `ready`
+- write the final task payload to `benchmark-1gb-web-task.json`
+
 ## Enable It In Spark
 
 ### 1. Generate `.uimeta` snapshots

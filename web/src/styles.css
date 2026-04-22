@@ -1,10 +1,20 @@
 :root {
   color-scheme: light;
-  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+  --ink: #18202b;
+  --muted: #546174;
+  --line: rgba(35, 51, 79, 0.12);
+  --panel: rgba(255, 251, 245, 0.82);
+  --panel-strong: rgba(255, 255, 255, 0.95);
+  --accent: #b6461f;
+  --accent-strong: #872f15;
+  --sage: #d8e0cd;
+  --shadow: 0 24px 80px rgba(43, 36, 22, 0.12);
   background:
-    radial-gradient(circle at top, rgba(50, 85, 255, 0.12), transparent 28%),
-    linear-gradient(180deg, #f6f8ff 0%, #eef2ff 100%);
-  color: #172033;
+    radial-gradient(circle at 10% 20%, rgba(214, 92, 48, 0.22), transparent 28%),
+    radial-gradient(circle at 90% 10%, rgba(147, 168, 112, 0.25), transparent 30%),
+    linear-gradient(180deg, #f8efe4 0%, #f3f1ea 40%, #eef2e8 100%);
+  color: var(--ink);
 }
 
 * {
@@ -22,79 +32,295 @@ body {
   min-height: 100vh;
 }
 
-button {
+button,
+input,
+select,
+textarea {
   font: inherit;
+}
+
+button,
+.link-action {
+  transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+
+button:hover,
+.link-action:hover {
+  transform: translateY(-1px);
 }
 
 .app-shell {
   min-height: 100vh;
-  padding: 48px 20px;
-  display: grid;
-  place-items: center;
-}
-
-.hero,
-.panel {
-  width: min(720px, 100%);
+  padding: 36px 18px 52px;
 }
 
 .hero {
-  margin-bottom: 20px;
+  max-width: 920px;
+  margin: 0 auto 28px;
 }
 
 .eyebrow {
   margin: 0 0 10px;
   text-transform: uppercase;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.18em;
   font-size: 0.75rem;
-  color: #5a6785;
+  color: var(--accent-strong);
+}
+
+h1,
+h2,
+h4 {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
 }
 
 h1 {
-  margin: 0;
-  font-size: clamp(2.5rem, 5vw, 4.5rem);
-  line-height: 0.95;
+  font-size: clamp(2.7rem, 5vw, 5rem);
+  line-height: 0.92;
+  max-width: 10ch;
 }
 
 .subtitle {
-  max-width: 56ch;
-  margin: 16px 0 0;
-  font-size: 1.05rem;
-  line-height: 1.6;
-  color: #41506c;
+  margin: 18px 0 0;
+  max-width: 62ch;
+  color: var(--muted);
+  line-height: 1.7;
+  font-size: 1.04rem;
+}
+
+.workspace-grid {
+  max-width: 1400px;
+  margin: 0 auto;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: 1.05fr 1.1fr 0.9fr;
+  align-items: start;
 }
 
 .panel {
-  padding: 20px;
-  border: 1px solid rgba(82, 98, 142, 0.16);
-  border-radius: 24px;
-  background: rgba(255, 255, 255, 0.76);
-  box-shadow: 0 20px 60px rgba(32, 47, 90, 0.08);
-  backdrop-filter: blur(16px);
+  min-height: 320px;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 28px;
+  background: var(--panel);
+  backdrop-filter: blur(14px);
+  box-shadow: var(--shadow);
+}
+
+.panel h2 {
+  margin-bottom: 18px;
+  font-size: 1.45rem;
+}
+
+.panel-form,
+.details-stack {
+  display: grid;
+  gap: 16px;
 }
 
 .tab-row {
-  display: flex;
-  gap: 12px;
+  display: inline-flex;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
-.tab {
-  border: 0;
+.tab,
+.action-row button {
+  border: 1px solid transparent;
   border-radius: 999px;
-  padding: 12px 18px;
-  background: #dbe5ff;
-  color: #20325d;
+  padding: 11px 16px;
+  background: rgba(255, 255, 255, 0.66);
+  color: var(--ink);
   cursor: pointer;
 }
 
-.tab.active {
-  background: #1e3a8a;
+.tab.active,
+.primary-action,
+.link-action {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
   color: white;
+  box-shadow: 0 14px 32px rgba(182, 70, 31, 0.22);
 }
 
-.hint {
-  margin: 16px 0 0;
-  color: #374867;
+.hint,
+.muted-copy {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+}
+
+.field span {
   font-weight: 600;
+  color: #233142;
+}
+
+.field-row {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.field input,
+.field select {
+  width: 100%;
+  padding: 13px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(40, 55, 75, 0.14);
+  background: var(--panel-strong);
+  color: var(--ink);
+}
+
+.inline-error {
+  margin: 0;
+  color: #8b2515;
+  font-weight: 600;
+}
+
+.primary-action {
+  display: inline-flex;
+  justify-content: center;
+  border: 0;
+  border-radius: 18px;
+  padding: 14px 18px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.status-strip,
+.action-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: #eae7e0;
+}
+
+.status-ready {
+  background: #d7ead5;
+  color: #2d5a27;
+}
+
+.status-failed {
+  background: #f6d9d1;
+  color: #9a2d17;
+}
+
+.status-stopped {
+  background: #e3e1de;
+  color: #4f5963;
+}
+
+.status-queued,
+.status-preprocessing,
+.status-validating,
+.status-starting_history_server {
+  background: #f3e4c5;
+  color: #875c1a;
+}
+
+.details-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.details-grid div {
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.56);
+  border: 1px solid rgba(54, 66, 84, 0.08);
+}
+
+.details-grid dt {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.details-grid dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+.logs-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.logs-grid pre {
+  margin: 10px 0 0;
+  max-height: 190px;
+  overflow: auto;
+  padding: 14px;
+  border-radius: 18px;
+  background: #181f29;
+  color: #ecf2ff;
+  font-family: "SFMono-Regular", "Menlo", monospace;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-card {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  padding: 16px;
+  border: 1px solid rgba(57, 72, 93, 0.08);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.64);
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-card.selected {
+  border-color: rgba(182, 70, 31, 0.32);
+  box-shadow: 0 14px 30px rgba(182, 70, 31, 0.12);
+}
+
+@media (max-width: 1160px) {
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+
+  h1 {
+    max-width: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    padding: 24px 14px 36px;
+  }
+
+  .panel {
+    padding: 18px;
+    border-radius: 22px;
+  }
+
+  .field-row,
+  .details-grid {
+    grid-template-columns: 1fr;
+  }
 }
