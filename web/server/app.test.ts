@@ -229,6 +229,37 @@ test("skips invalid persisted tasks and emits a warning", () => {
   warnSpy.mockRestore();
 });
 
+test("reads legacy persisted tasks without outputMode and workspaceDir", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "spark-ui-service-web-"));
+  const workspaceRoot = path.join(tempRoot, ".local-runs");
+  const store = new TaskStore(workspaceRoot);
+
+  const taskDir = path.join(workspaceRoot, "legacy-task");
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(taskDir, "task.json"),
+    JSON.stringify({
+      id: "legacy-task",
+      status: "queued",
+      inputMode: "path",
+      sourceLabel: "legacy.eventlog",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    })
+  );
+
+  expect(store.get("legacy-task")).toMatchObject({
+    id: "legacy-task",
+    outputMode: "managed",
+    workspaceDir: taskDir
+  });
+  expect(store.list()[0]).toMatchObject({
+    id: "legacy-task",
+    outputMode: "managed",
+    workspaceDir: taskDir
+  });
+});
+
 function createReadableEventLog(tempRoot: string, fileName: string) {
   const eventLogPath = path.join(tempRoot, fileName);
   fs.writeFileSync(eventLogPath, '{"Event":"SparkListenerLogStart","Spark Version":"3.3.0"}\n');

@@ -59,16 +59,29 @@ export class TaskStore {
 
     try {
       const parsed = JSON.parse(fs.readFileSync(taskPath, "utf8")) as Partial<TaskRecord>;
-      if (!this.isTaskRecord(parsed)) {
+      const normalized = this.normalizeTaskRecord(parsed);
+      if (!this.isTaskRecord(normalized)) {
         this.warnSkippedTask(taskId, "task.json is missing required fields or contains unsupported values");
         return undefined;
       }
 
-      return parsed;
+      return normalized;
     } catch {
       this.warnSkippedTask(taskId, "task.json could not be parsed");
       return undefined;
     }
+  }
+
+  private normalizeTaskRecord(task: Partial<TaskRecord> | undefined): Partial<TaskRecord> | undefined {
+    if (!task || typeof task.id !== "string") {
+      return task;
+    }
+
+    return {
+      ...task,
+      outputMode: task.outputMode ?? "managed",
+      workspaceDir: task.workspaceDir ?? taskWorkspace(this.workspaceRoot, task.id)
+    };
   }
 
   private isTaskRecord(task: Partial<TaskRecord> | undefined): task is TaskRecord {
