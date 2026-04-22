@@ -32,8 +32,13 @@ object UIMetaFile extends Logging {
   def writeHeader(out: DataOutputStream): Unit = out.write(MAGIC_NUMBER)
 
   def writeElement(out: DataOutputStream, className: String, instance: AnyRef): Unit = {
+    writeRawElement(out, className, serialize(instance))
+  }
+
+  def serialize(instance: AnyRef): Array[Byte] = mapper.writeValueAsBytes(instance)
+
+  def writeRawElement(out: DataOutputStream, className: String, dataBytes: Array[Byte]): Unit = {
     val classNameBytes = className.getBytes(StandardCharsets.UTF_8)
-    val dataBytes = mapper.writeValueAsBytes(instance)
     out.writeInt(classNameBytes.length)
     out.write(classNameBytes)
     out.writeInt(dataBytes.length)
