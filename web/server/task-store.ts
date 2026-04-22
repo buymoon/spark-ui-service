@@ -22,17 +22,24 @@ export class TaskStore {
     fs.mkdirSync(this.workspaceRoot, { recursive: true });
   }
 
-  create(record: Omit<TaskRecord, "id" | "createdAt" | "updatedAt" | "workspaceDir">): TaskRecord {
+  create(
+    record: Omit<TaskRecord, "id" | "runToken" | "createdAt" | "updatedAt" | "workspaceDir"> & {
+      workspaceDir?: string;
+    }
+  ): TaskRecord {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
+    const workspaceDir = record.workspaceDir ?? taskWorkspace(this.workspaceRoot, id);
     const task: TaskRecord = {
       ...record,
       id,
-      workspaceDir: taskWorkspace(this.workspaceRoot, id),
+      runToken: crypto.randomUUID(),
+      workspaceDir,
       createdAt: now,
       updatedAt: now
     };
 
+    fs.mkdirSync(taskWorkspace(this.workspaceRoot, id), { recursive: true });
     fs.mkdirSync(task.workspaceDir, { recursive: true });
     fs.writeFileSync(taskFile(this.workspaceRoot, id, "task.json"), JSON.stringify(task, null, 2));
     return task;
@@ -49,6 +56,23 @@ export class TaskStore {
 
   get(taskId: string): TaskRecord | undefined {
     return this.readTask(taskId);
+  }
+
+  update(taskId: string, patch: Partial<TaskRecord>): TaskRecord {
+    const current = this.get(taskId);
+    if (!current) {
+      throw new Error(`Task ${taskId} not found.`);
+    }
+
+    const next: TaskRecord = {
+      ...current,
+      ...patch,
+      updatedAt: new Date().toISOString()
+    };
+    fs.mkdirSync(taskWorkspace(this.workspaceRoot, taskId), { recursive: true });
+    fs.mkdirSync(next.workspaceDir, { recursive: true });
+    fs.writeFileSync(taskFile(this.workspaceRoot, taskId, "task.json"), JSON.stringify(next, null, 2));
+    return next;
   }
 
   private readTask(taskId: string): TaskRecord | undefined {
@@ -80,6 +104,7 @@ export class TaskStore {
     return {
       ...task,
       outputMode: task.outputMode ?? "managed",
+      runToken: task.runToken ?? `legacy-${task.id}`,
       workspaceDir: task.workspaceDir ?? taskWorkspace(this.workspaceRoot, task.id)
     };
   }
