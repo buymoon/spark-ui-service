@@ -22,6 +22,10 @@ interface CreateTaskExecutorInput {
   baseHistoryPort?: number;
 }
 
+export function buildHistoryProxyUrl(taskId: string, appId: string) {
+  return `/history-proxy/${taskId}/history/${appId}/jobs/`;
+}
+
 export function launchEventLogPreprocessor(
   runtime: SparkRuntime,
   input: EventLogPreprocessorLaunchInput
@@ -137,7 +141,7 @@ export function createTaskExecutor(input: CreateTaskExecutorInput): TaskExecutor
         attemptId: result.attemptId,
         uimetaPath: result.uimetaPath,
         historyPort,
-        historyUrl: `http://127.0.0.1:${historyPort}/history/${result.appId}/jobs/`
+        historyUrl: buildHistoryProxyUrl(taskId, result.appId)
       };
     },
     stop: async (taskId: string) => {

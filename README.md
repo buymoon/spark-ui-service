@@ -130,6 +130,35 @@ SPARK_HOME=/opt/spark npm run dev:server
 
 The backend listens on port `3000` by default.
 
+### Reuse a local Spark Docker image
+
+If you already have a local Spark image, `scripts/prepare_spark_runtime_from_image.sh` can extract a matching Spark + Java runtime to the host filesystem so that you can mount it into Linux containers:
+
+```bash
+eval "$(bash scripts/prepare_spark_runtime_from_image.sh)"
+printf 'SPARK_HOME=%s\nJAVA_HOME=%s\n' "$SPARK_HOME" "$JAVA_HOME"
+```
+
+By default the helper script:
+
+- inspects local `apache/spark:*` images only and does not pull anything
+- prefers an image matching the repository `spark.version` from `pom.xml`
+- falls back to the first local `apache/spark:*` image if no exact family match exists
+
+You can force a specific local tag or custom runtime paths inside the image:
+
+```bash
+SPARK_IMAGE=apache/spark:3.5.3-scala2.12-java17-ubuntu \
+SPARK_IMAGE_SPARK_HOME=/opt/spark \
+SPARK_IMAGE_JAVA_HOME=/opt/java/openjdk \
+bash scripts/prepare_spark_runtime_from_image.sh
+```
+
+Note:
+
+- the extracted runtime contains Linux binaries, so it is meant for container mounts rather than direct macOS execution
+- the helper only inspects local images; it does not pull missing tags
+
 ### Start the frontend
 
 In a second terminal:
@@ -148,6 +177,28 @@ After the backend is running, you can drive the path-mode API end-to-end with:
 ```bash
 bash scripts/run_1gb_web_e2e.sh
 ```
+
+If `SPARK_HOME` is missing, the script will:
+
+- build the generator test jar locally
+- detect a local `apache/spark:*` image, or use `SPARK_IMAGE` if you set one
+- run `LargeEventLogGenerator` inside that local Spark image
+- write the eventlog and `.uimeta` back to the host via bind mounts
+
+That means the 1 GB generator path works even when the host does not have a native Spark installation.
+
+If your `web` backend runs inside a container, set `TASK_EVENT_LOG_DIR` to the eventlog path as seen from inside that backend container. Example:
+
+```bash
+EVENT_LOG_DIR="$PWD/.e2e-spark-events/smoke" \
+TASK_EVENT_LOG_DIR=/tmp/spark-events/smoke \
+bash scripts/run_1gb_web_e2e.sh
+```
+
+In that setup:
+
+- `EVENT_LOG_DIR` is where the generator writes on the host
+- `TASK_EVENT_LOG_DIR` is the absolute path the backend can actually read
 
 The script will:
 

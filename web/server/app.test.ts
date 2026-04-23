@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
@@ -162,6 +163,7 @@ test("returns persisted runtime metadata in task details", async () => {
   expect(detailResponse.body.task).toMatchObject({
     id: task.id,
     updatedAt: updatedTask.updatedAt,
+    historyUrl: `/history-proxy/${task.id}/history/app-123/jobs/`,
     attemptId: "attempt-1",
     uimetaPath: "/tmp/app-123_attempt-1.uimeta",
     historyPort: 18081,
@@ -173,6 +175,68 @@ test("returns persisted runtime metadata in task details", async () => {
     historyServerState: "ready",
     errorSummary: "none"
   });
+});
+
+test("proxies spark history html and rewrites absolute asset paths", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "spark-ui-service-web-"));
+  const workspaceRoot = path.join(tempRoot, ".local-runs");
+  const store = new TaskStore(workspaceRoot);
+  const upstream = await startMockHistoryServer();
+
+  const task = store.create({
+    status: "ready",
+    inputMode: "path",
+    outputMode: "managed",
+    sourceLabel: "sample.eventlog",
+    sourcePath: createReadableEventLog(tempRoot, "sample.eventlog"),
+    appId: "app-123",
+    historyUrl: "/history-proxy/task-under-test/history/app-123/jobs/"
+  });
+  store.update(task.id, {
+    historyPort: upstream.port,
+    historyServerState: "ready"
+  });
+
+  const app = createApp({ workspaceRoot });
+  const response = await request(app).get(`/history-proxy/${task.id}/history/app-123/jobs/`);
+
+  expect(response.status).toBe(200);
+  expect(response.text).toContain(`href="/history-proxy/${task.id}/static/webui.css"`);
+  expect(response.text).toContain(`src="/history-proxy/${task.id}/static/webui.js"`);
+  expect(response.text).toContain(`setUIRoot('/history-proxy/${task.id}')`);
+  expect(response.text).toContain(`setAppBasePath('/history-proxy/${task.id}/history/app-123')`);
+
+  await stopMockHistoryServer(upstream.server);
+});
+
+test("proxies spark history static assets through the task route", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "spark-ui-service-web-"));
+  const workspaceRoot = path.join(tempRoot, ".local-runs");
+  const store = new TaskStore(workspaceRoot);
+  const upstream = await startMockHistoryServer();
+
+  const task = store.create({
+    status: "ready",
+    inputMode: "path",
+    outputMode: "managed",
+    sourceLabel: "sample.eventlog",
+    sourcePath: createReadableEventLog(tempRoot, "sample.eventlog"),
+    appId: "app-123",
+    historyUrl: "/history-proxy/task-under-test/history/app-123/jobs/"
+  });
+  store.update(task.id, {
+    historyPort: upstream.port,
+    historyServerState: "ready"
+  });
+
+  const app = createApp({ workspaceRoot });
+  const response = await request(app).get(`/history-proxy/${task.id}/static/webui.css`);
+
+  expect(response.status).toBe(200);
+  expect(response.text).toBe("body { color: rgb(1, 2, 3); }");
+  expect(response.headers["content-type"]).toMatch(/text\/css/);
+
+  await stopMockHistoryServer(upstream.server);
 });
 
 test("cleans up staged uploads when validation fails", async () => {
@@ -591,4 +655,60 @@ function createDeferred<T>() {
 
 async function waitForAsyncWork() {
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function startMockHistoryServer() {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/history/app-123/jobs/") {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(`<!DOCTYPE html>
+<html>
+  <head>
+    <link rel="stylesheet" href="/static/webui.css" />
+    <script src="/static/webui.js"></script>
+    <script>setUIRoot('')</script>
+    <script>setAppBasePath('/history/app-123')</script>
+  </head>
+  <body>jobs</body>
+</html>`);
+      return;
+    }
+
+    if (req.url === "/static/webui.css") {
+      res.setHeader("Content-Type", "text/css; charset=utf-8");
+      res.end("body { color: rgb(1, 2, 3); }");
+      return;
+    }
+
+    if (req.url === "/static/webui.js") {
+      res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+      res.end("console.log('spark');");
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end("missing");
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to determine the mock history server port.");
+  }
+
+  return { server, port: address.port };
+}
+
+async function stopMockHistoryServer(server: http.Server) {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
 }

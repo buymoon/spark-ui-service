@@ -5,7 +5,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { vi } from "vitest";
 import { resolveSparkRuntime } from "./spark-runtime";
-import { launchEventLogPreprocessor } from "./task-executor";
+import { buildHistoryProxyUrl, launchEventLogPreprocessor } from "./task-executor";
 
 test("resolveSparkRuntime discovers spark binaries and the built project jar", () => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "spark-ui-service-runtime-"));
@@ -93,4 +93,8 @@ test("launchEventLogPreprocessor spawns spark-submit with the offline preprocess
   expect(writeStreamSpy).toHaveBeenCalledWith(logFile, expect.any(Object));
 
   writeStreamSpy.mockRestore();
+});
+
+test("buildHistoryProxyUrl returns a stable in-app history route", () => {
+  expect(buildHistoryProxyUrl("task-123", "app-456")).toBe("/history-proxy/task-123/history/app-456/jobs/");
 });

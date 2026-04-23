@@ -1,6 +1,7 @@
 import express from "express";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import multer from "multer";
 import path from "node:path";
 import { TaskStore } from "./task-store";
@@ -138,6 +139,62 @@ export function createApp(context: AppContext) {
         historyServer: readTaskLog(task.historyServerLogPath)
       }
     });
+  });
+
+  app.get("/history-proxy/:id/*", (req, res) => {
+    const task = store.get(req.params.id);
+    if (!task) {
+      return res.status(404).send("Task not found.");
+    }
+    if (!task.historyPort) {
+      return res.status(409).send("History server is not ready for this task.");
+    }
+
+    const queryIndex = req.originalUrl.indexOf("?");
+    const querySuffix = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : "";
+    const upstreamPath = `/${req.params[0] ?? ""}${querySuffix}`;
+    const upstream = http.request(
+      {
+        host: "127.0.0.1",
+        port: task.historyPort,
+        path: upstreamPath,
+        method: "GET",
+        headers: {
+          ...req.headers,
+          host: `127.0.0.1:${task.historyPort}`,
+          "accept-encoding": "identity"
+        }
+      },
+      (upstreamResponse) => {
+        const statusCode = upstreamResponse.statusCode ?? 502;
+        const contentType = String(upstreamResponse.headers["content-type"] ?? "");
+        const rewriteHtml = contentType.startsWith("text/html");
+
+        if (!rewriteHtml) {
+          copyProxyHeaders(upstreamResponse.headers, res, req.params.id);
+          res.status(statusCode);
+          upstreamResponse.pipe(res);
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        upstreamResponse.on("data", (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        upstreamResponse.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf8");
+          copyProxyHeaders(upstreamResponse.headers, res, req.params.id, { rewriteBody: true });
+          res.status(statusCode).send(rewriteSparkHistoryHtml(body, req.params.id));
+        });
+      }
+    );
+
+    upstream.on("error", (error) => {
+      if (!res.headersSent) {
+        res.status(502).send(`Failed to reach the history server: ${error.message}`);
+      }
+    });
+    upstream.end();
   });
 
   app.post("/api/tasks/:id/stop", async (req, res) => {
@@ -298,7 +355,7 @@ function toTaskResponse(task: TaskRecord): TaskResponse {
     sourceLabel: task.sourceLabel,
     createdAt: task.createdAt,
     appId: task.appId,
-    historyUrl: task.historyUrl,
+    historyUrl: resolveTaskHistoryUrl(task),
     outputMode: task.outputMode
   };
 }
@@ -341,4 +398,69 @@ function readTaskLog(filePath?: string) {
   } catch {
     return "";
   }
+}
+
+function resolveTaskHistoryUrl(task: TaskRecord) {
+  if (task.appId && task.historyPort) {
+    return `/history-proxy/${task.id}/history/${task.appId}/jobs/`;
+  }
+
+  return task.historyUrl;
+}
+
+function copyProxyHeaders(
+  headers: http.IncomingHttpHeaders,
+  response: express.Response,
+  taskId: string,
+  options?: { rewriteBody?: boolean }
+) {
+  for (const [headerName, headerValue] of Object.entries(headers)) {
+    if (!headerValue) {
+      continue;
+    }
+
+    const normalizedName = headerName.toLowerCase();
+    if (
+      normalizedName === "connection" ||
+      normalizedName === "keep-alive" ||
+      normalizedName === "transfer-encoding" ||
+      normalizedName === "content-encoding" ||
+      (options?.rewriteBody && normalizedName === "content-length")
+    ) {
+      continue;
+    }
+
+    if (normalizedName === "location") {
+      response.setHeader(headerName, rewriteProxyLocationHeader(headerValue, taskId));
+      continue;
+    }
+
+    response.setHeader(headerName, headerValue);
+  }
+}
+
+function rewriteProxyLocationHeader(headerValue: string | string[], taskId: string) {
+  if (Array.isArray(headerValue)) {
+    return headerValue.map((value) => rewriteProxyLocationHeader(value, taskId));
+  }
+
+  if (headerValue.startsWith("/static/")) {
+    return `/history-proxy/${taskId}${headerValue}`;
+  }
+  if (headerValue.startsWith("/history/")) {
+    return `/history-proxy/${taskId}${headerValue}`;
+  }
+
+  return headerValue;
+}
+
+function rewriteSparkHistoryHtml(html: string, taskId: string) {
+  const proxyRoot = `/history-proxy/${taskId}`;
+  return html
+    .replaceAll('href="/static/', `href="${proxyRoot}/static/`)
+    .replaceAll('src="/static/', `src="${proxyRoot}/static/`)
+    .replaceAll("setUIRoot('')", `setUIRoot('${proxyRoot}')`)
+    .replaceAll("setAppBasePath('/history/", `setAppBasePath('${proxyRoot}/history/`)
+    .replaceAll('href="/history/', `href="${proxyRoot}/history/`)
+    .replaceAll('src="/history/', `src="${proxyRoot}/history/`);
 }
