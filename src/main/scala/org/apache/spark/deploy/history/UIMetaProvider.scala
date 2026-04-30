@@ -66,7 +66,7 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
           in.close()
         }
 
-        val appStatusStore = new AppStatusStore(store)
+        val appStatusStore = UIMetaProvider.createAppStatusStore(store)
         val info = appStatusStore.applicationInfo()
         val appName = info.name
         val startTime = info.attempts.headOption
@@ -119,4 +119,25 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
 
   override def checkUIViewPermissions(
       appId: String, attemptId: Option[String], user: String): Boolean = true
+}
+
+private object UIMetaProvider {
+  def createAppStatusStore(store: InMemoryStore): AppStatusStore = {
+    val ctor = classOf[AppStatusStore].getConstructors
+      .sortBy(_.getParameterCount)
+      .find(c => c.getParameterCount == 2 || c.getParameterCount == 3)
+      .getOrElse {
+        throw new IllegalStateException(
+          s"Unsupported AppStatusStore constructor shape: " +
+            classOf[AppStatusStore].getConstructors.map(_.toString).mkString(", ")
+        )
+      }
+
+    ctor.getParameterCount match {
+      case 2 => ctor.newInstance(store, scala.None).asInstanceOf[AppStatusStore]
+      case 3 => ctor.newInstance(store, scala.None, scala.None).asInstanceOf[AppStatusStore]
+      case count =>
+        throw new IllegalStateException(s"Unsupported AppStatusStore constructor parameter count: $count")
+    }
+  }
 }
