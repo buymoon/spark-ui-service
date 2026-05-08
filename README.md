@@ -51,6 +51,9 @@ Spark History Server
 - `UIMetaFile`
   - Utility for reading and writing `.uimeta` files
   - Uses a simple binary layout with a magic header, class name, and JSON bytes
+- `EventLogPreprocessor`
+  - Offline converter for existing Spark event logs
+  - Supports exact `replay` mode and lightweight `fast-summary` mode for very large logs
 
 ## Tech Stack
 
@@ -128,11 +131,11 @@ spark-submit \
 ### 2. Start History Server with `UIMetaProvider`
 
 ```bash
-spark-class org.apache.spark.deploy.history.HistoryServer \
-  --properties-file /dev/null \
-  --conf spark.history.fs.logDirectory=file:///tmp/spark-events \
-  --conf spark.history.provider=org.apache.spark.deploy.history.UIMetaProvider \
-  --conf spark.uimeta.dir=file:///tmp/spark-uimeta
+spark-class \
+  -Dspark.history.fs.logDirectory=file:///tmp/spark-events \
+  -Dspark.history.provider=org.apache.spark.deploy.history.UIMetaProvider \
+  -Dspark.uimeta.dir=file:///tmp/spark-uimeta \
+  org.apache.spark.deploy.history.HistoryServer
 ```
 
 Notes:
@@ -157,12 +160,66 @@ Recommended preparation steps:
 
 After startup, Spark History Server is available at [http://localhost:18080](http://localhost:18080).
 
+## Load An Existing Event Log
+
+If you already have a Spark event log and want to turn it into a `.uimeta` snapshot before opening the UI, use the helper script:
+
+```bash
+bash scripts/open_eventlog_history_ui.sh /path/to/your/eventlog
+```
+
+The script:
+
+1. Builds `target/spark-uiservice-1.0-SNAPSHOT.jar` if needed
+2. Converts the event log to `.uimeta`
+3. Uses `fast-summary` mode by default so very large logs can open a job/stage overview quickly
+4. Starts the local History Server from `docker-compose.yml`
+5. Prints the direct URL for the reconstructed Spark UI
+
+Use exact replay mode when you need the full Spark UI data, including task-level detail:
+
+```bash
+bash scripts/open_eventlog_history_ui.sh /path/to/your/eventlog replay
+```
+
+The direct URL usually looks like:
+
+```text
+http://127.0.0.1:18080/history/<appId>/jobs/
+```
+
+### Offline converter modes
+
+`EventLogPreprocessor` supports two modes:
+
+- `replay`
+  - Default mode for direct CLI calls
+  - Replays the event log through Spark's native listener bus
+  - Produces the most complete `.uimeta`, but can be slow for multi-GB logs
+- `fast-summary`
+  - Streams JSON event-log lines
+  - Skips task-level events and writes app/job/stage summary metadata
+  - Intended for quickly opening an overview for very large files, such as 20 GB event logs
+
+Example:
+
+```bash
+spark-submit \
+  --class org.apache.spark.deploy.history.EventLogPreprocessor \
+  target/spark-uiservice-1.0-SNAPSHOT.jar \
+  --event-log file:///path/to/eventlog \
+  --uimeta-dir file:///tmp/spark-uimeta \
+  --mode fast-summary
+```
+
 ## Benchmarking
 
 The repository includes two helper programs for testing and benchmarking:
 
 - `LargeEventLogGenerator`
   - Generates many Spark jobs and SQL queries to produce larger event logs and `.uimeta` files
+- `EventLogPreprocessor`
+  - Replays an existing Spark event log and writes a matching `.uimeta` snapshot
 - `ReadPerformanceTest`
   - Compares load time and file size between `FsHistoryProvider` and `UIMetaProvider`
 
@@ -175,6 +232,26 @@ spark-submit \
   100 1000
 ```
 
+The generator also supports target-size mode, which keeps producing jobs until the event log reaches a requested size:
+
+```bash
+spark-submit \
+  --class org.apache.spark.deploy.history.LargeEventLogGenerator \
+  target/spark-uiservice-1.0-SNAPSHOT.jar \
+  --target-eventlog-gb 4 \
+  --tasks-per-job 4096 \
+  --records-per-task 1 \
+  --progress-every-jobs 1 \
+  --sql-every-jobs 0 \
+  --sql-queries-per-batch 1 \
+  --sql-rows-per-query 1000 \
+  --max-jobs 128
+```
+
+This mode is useful when you want a benchmark dataset close to a real target, such as a 4 GB event log.
+
+For large target sizes, the number of tasks usually has a much bigger effect on event log growth than the amount of data processed inside each task. Using a very small `records-per-task` value keeps the benchmark focused on history replay cost instead of spending extra time on unnecessary computation.
+
 ### Run the performance comparison
 
 ```bash
@@ -185,6 +262,35 @@ spark-submit \
 ```
 
 If `appId` is omitted, the program uses the most recent event log under `/tmp/spark-events`.
+
+### Run the 4 GB benchmark end-to-end
+
+After preparing `target/spark-uiservice-tests.jar`, you can use the helper script:
+
+```bash
+bash scripts/run_4gb_benchmark.sh
+```
+
+By default, the script:
+
+- generates an event log targeting 4 GB
+- uses `4096` tasks per job with `records-per-task=1` to grow the event log with lower compute overhead
+- adds one lightweight SQL batch so SQL UI metadata is still present in the snapshot
+- writes output under `benchmark-4gb-events/` and `benchmark-4gb-uimeta/`
+- runs `ReadPerformanceTest`
+- stores the final benchmark output in `benchmark-4gb-report.txt`
+
+You can override the defaults with environment variables such as `TARGET_GB`, `TASKS_PER_JOB`, `RECORDS_PER_TASK`, `SPARK_IMAGE`, and `REPORT_FILE`.
+
+Validated calibration run on this repository:
+
+- Event log size: `88.39 MB`
+- UIMeta size: `41.15 MB`
+- `FsHistoryProvider`: `13147 ms`
+- `UIMetaProvider`: `2102 ms`
+- Latency reduction: `84.0%`
+
+That run used the same high-task / low-record generation strategy as the 4 GB script, so it is a good sanity check before starting a much longer full-size benchmark.
 
 ## Development Notes
 

@@ -9,7 +9,6 @@ import scala.util.control.NonFatal
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.{SecurityManager, SparkConf}
 import org.apache.spark.internal.Logging
-import org.apache.spark.status.AppStatusStore
 import org.apache.spark.status.api.v1.{ApplicationInfo => ApiApplicationInfo}
 import org.apache.spark.ui.SparkUI
 import org.apache.spark.util.kvstore.InMemoryStore
@@ -66,7 +65,7 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
           in.close()
         }
 
-        val appStatusStore = new AppStatusStore(store)
+        val appStatusStore = SparkUIServiceCompat.createAppStatusStore(store)
         val info = appStatusStore.applicationInfo()
         val appName = info.name
         val startTime = info.attempts.headOption
