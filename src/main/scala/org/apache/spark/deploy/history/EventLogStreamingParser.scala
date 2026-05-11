@@ -1,0 +1,1309 @@
+package org.apache.spark.deploy.history
+
+import java.io.{BufferedReader, InputStreamReader}
+import java.nio.charset.StandardCharsets
+import java.util.Date
+
+import scala.collection.JavaConverters._
+import scala.collection.mutable
+
+import com.fasterxml.jackson.core.JsonProcessingException
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
+import org.apache.spark.JobExecutionStatus
+import org.apache.spark.internal.Logging
+import org.apache.spark.status.api.v1._
+import org.apache.spark.sql.execution.SparkPlanInfo
+import org.apache.spark.sql.execution.metric.SQLMetricInfo
+import org.apache.spark.sql.execution.ui.{
+  SQLExecutionUIData,
+  SQLPlanMetric,
+  SparkPlanGraph,
+  SparkPlanGraphCluster,
+  SparkPlanGraphClusterWrapper,
+  SparkPlanGraphNode,
+  SparkPlanGraphNodeWrapper,
+  SparkPlanGraphWrapper
+}
+import org.apache.spark.ui.scope.RDDOperationEdge
+
+private[history] object EventLogStreamingParser extends Logging {
+
+  private val mapper: ObjectMapper = {
+    val m = new ObjectMapper()
+    m.registerModule(DefaultScalaModule)
+    m
+  }
+
+  private val interestingEvents = Set(
+    "SparkListenerApplicationStart",
+    "SparkListenerApplicationEnd",
+    "SparkListenerEnvironmentUpdate",
+    "SparkListenerJobStart",
+    "SparkListenerJobEnd",
+    "SparkListenerStageSubmitted",
+    "SparkListenerStageCompleted")
+
+  private val SqlAccumulatorMetadata = "sql"
+  private val SqlRetainedExecutionsConf = "spark.sql.ui.retainedExecutions"
+  private val DefaultSqlRetainedExecutions = 1000
+  private val sqlExecutionStartEvents = Set(
+    "SparkListenerSQLExecutionStart",
+    "org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionStart")
+  private val sqlExecutionEndEvents = Set(
+    "SparkListenerSQLExecutionEnd",
+    "org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd")
+
+  def writeUIMeta(
+      eventLog: String,
+      uimetaDir: String,
+      attemptIdOverride: Option[String],
+      compression: String,
+      taskShardRecords: Int,
+      hadoopConf: Configuration): EventLogPreprocessResult = {
+    require(taskShardRecords > 0, "taskShardRecords must be positive")
+    UIMetaV2Compression.validate(UIMetaV2Compression.normalize(compression), hadoopConf)
+
+    val parsed = parse(
+      eventLog,
+      uimetaDir,
+      attemptIdOverride,
+      compression,
+      taskShardRecords,
+      hadoopConf)
+    val summary = parsed.summary
+    val attemptId = attemptIdOverride.orElse(summary.attemptId)
+    val writer = parsed.writerFor(summary, attemptId)
+
+    writeSummaryShards(writer, summary, attemptId)
+    val metaPath = writer.commit(UIMetaV2Counts(
+      jobs = summary.jobs.size,
+      stages = summary.stages.size,
+      tasks = parsed.totalTasks,
+      sqlExecutions = summary.sqlExecutions.count(_.graph.isDefined)),
+      completedOverride = Some(summary.completed))
+    val historyPath = attemptId match {
+      case Some(id) => s"/history/${summary.appId}/$id/jobs/"
+      case None => s"/history/${summary.appId}/jobs/"
+    }
+
+    EventLogPreprocessResult(eventLog, summary.appId, attemptId, metaPath, historyPath, "stream-v2")
+  }
+
+  private def parse(
+      eventLog: String,
+      uimetaDir: String,
+      attemptIdOverride: Option[String],
+      compression: String,
+      taskShardRecords: Int,
+      hadoopConf: Configuration): ParsedEventLog = {
+    val path = new Path(eventLog)
+    val fs = path.getFileSystem(hadoopConf)
+    val state = new SummaryState(inferAppId(path))
+    val context = new ParseContext(
+      state,
+      eventLog,
+      uimetaDir,
+      attemptIdOverride,
+      compression,
+      taskShardRecords,
+      hadoopConf)
+
+    EventLogFileReader(fs, path) match {
+      case Some(reader) =>
+        val files = reader.listEventLogFiles
+        val lastFile = files.lastOption.map(_.getPath)
+        val eventLogInProgress = !reader.completed
+        files.foreach { status =>
+          val tolerateTruncatedFinalLine = lastFile.contains(status.getPath) &&
+            (eventLogInProgress || isInProgressPath(status.getPath))
+          scanFile(status, fs, context, tolerateTruncatedFinalLine)
+        }
+      case None =>
+        scanPath(path, fs, context, isInProgressPath(path))
+    }
+
+    context.flushTasks()
+    ParsedEventLog(state.toSummary(), context.writerOpt, context.totalTasks, context.newWriter)
+  }
+
+  private def scanFile(
+      status: FileStatus,
+      fs: FileSystem,
+      context: ParseContext,
+      tolerateTruncatedFinalLine: Boolean): Unit = {
+    scanPath(status.getPath, fs, context, tolerateTruncatedFinalLine)
+  }
+
+  private def scanPath(
+      path: Path,
+      fs: FileSystem,
+      context: ParseContext,
+      tolerateTruncatedFinalLine: Boolean): Unit = {
+    val in = EventLogFileReader.openEventLog(path, fs)
+    val reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8), 1024 * 1024)
+    try {
+      var line = reader.readLine()
+      while (line != null) {
+        val nextLine = reader.readLine()
+        handleLine(line, context, tolerateTruncatedFinalLine && nextLine == null)
+        line = nextLine
+      }
+    } finally {
+      reader.close()
+    }
+  }
+
+  private def handleLine(
+      line: String,
+      context: ParseContext,
+      tolerateMalformedJson: Boolean): Unit = {
+    eventName(line) match {
+      case Some("SparkListenerTaskEnd") =>
+        context.state.skippedTaskEvents += 1L
+        try {
+          val node = mapper.readTree(line)
+          handleTaskEnd(node, context)
+        } catch {
+          case _: JsonProcessingException if tolerateMalformedJson =>
+            context.state.truncatedFinalLine = true
+        }
+      case Some(name) if sqlExecutionStartEvents.contains(name) =>
+        try {
+          val node = mapper.readTree(line)
+          handleSqlExecutionStart(node, context.state)
+        } catch {
+          case _: JsonProcessingException if tolerateMalformedJson =>
+            context.state.truncatedFinalLine = true
+        }
+      case Some(name) if sqlExecutionEndEvents.contains(name) =>
+        try {
+          val node = mapper.readTree(line)
+          handleSqlExecutionEnd(node, context.state)
+        } catch {
+          case _: JsonProcessingException if tolerateMalformedJson =>
+            context.state.truncatedFinalLine = true
+        }
+      case Some(name) if name.startsWith("SparkListenerTask") =>
+        context.state.skippedTaskEvents += 1L
+      case Some(name) if interestingEvents.contains(name) =>
+        try {
+          val node = mapper.readTree(line)
+          handleEvent(name, node, context)
+        } catch {
+          case _: JsonProcessingException if tolerateMalformedJson =>
+            context.state.truncatedFinalLine = true
+        }
+      case _ =>
+    }
+  }
+
+  private def handleSqlExecutionStart(node: JsonNode, state: SummaryState): Unit = {
+    val executionId = long(node, "executionId").getOrElse(return)
+    sparkPlanInfo(node.get("sparkPlanInfo")).foreach { planInfo =>
+      val graph = SparkPlanGraph(planInfo)
+      val execution = state.getOrCreateSqlExecution(executionId)
+      execution.description = text(node, "description").getOrElse("")
+      execution.details = text(node, "details").getOrElse("")
+      execution.physicalPlanDescription = text(node, "physicalPlanDescription").getOrElse("")
+      execution.modifiedConfigs = objectFields(node.get("modifiedConfigs")).toMap
+      execution.metrics = graph.allNodes.flatMap(_.metrics).map { metric =>
+        metric.accumulatorId -> metric
+      }.toMap.values.toSeq
+      execution.submissionTime = long(node, "time").getOrElse(-1L)
+      execution.graph = Some(new SparkPlanGraphWrapper(
+        executionId,
+        toStoredSqlNodes(graph.nodes),
+        graph.edges))
+      state.pruneSqlExecutions()
+    }
+  }
+
+  private def handleSqlExecutionEnd(node: JsonNode, state: SummaryState): Unit = {
+    val executionId = long(node, "executionId").getOrElse(return)
+    state.sqlExecutions.get(executionId).foreach { execution =>
+      execution.completionTime = long(node, "time").map(new Date(_))
+      state.pruneSqlExecutions()
+    }
+  }
+
+  private def handleTaskEnd(node: JsonNode, context: ParseContext): Unit = {
+    val stageId = int(node, "Stage ID").getOrElse(return)
+    val attemptId = int(node, "Stage Attempt ID").getOrElse(0)
+    toTaskDataWrapper(node, stageId, attemptId).foreach { task =>
+      context.taskBuffer.append(StageAttemptKey(stageId, attemptId), task)
+    }
+  }
+
+  private def handleEvent(event: String, node: JsonNode, context: ParseContext): Unit = {
+    val state = context.state
+    event match {
+      case "SparkListenerApplicationStart" =>
+        val eventAppId = text(node, "App ID")
+        val eventAppName = text(node, "App Name")
+        state.appName = eventAppName.orElse(state.appName)
+        if (!state.pathMetadataFrozen) {
+          state.appId = eventAppId.orElse(state.appId)
+          state.attemptId = text(node, "App Attempt ID").orElse(state.attemptId)
+        }
+        state.startTime = long(node, "Timestamp").orElse(state.startTime)
+        state.user = text(node, "User").orElse(state.user)
+        if (eventAppId.isDefined) {
+          state.authoritativeAppIdSeen = true
+        }
+
+      case "SparkListenerApplicationEnd" =>
+        state.endTime = long(node, "Timestamp").orElse(state.endTime)
+        state.completed = true
+
+      case "SparkListenerEnvironmentUpdate" =>
+        state.environment = EnvironmentSummary.fromEvent(node)
+        state.environment.sparkProperties.get(SqlRetainedExecutionsConf)
+          .flatMap(parseInt)
+          .filter(_ > 0)
+          .foreach { retained => state.sqlRetainedExecutions = retained }
+        state.pruneSqlExecutions()
+        state.environment.sparkProperties.get("spark.app.id").foreach { appId =>
+          if (!state.pathMetadataFrozen && !state.authoritativeAppIdSeen) {
+            state.appId = Some(appId)
+          }
+          state.authoritativeAppIdSeen = true
+        }
+        state.environment.sparkProperties.get("spark.app.name").foreach { appName =>
+          state.appName = Some(appName)
+        }
+        if (!state.pathMetadataFrozen) {
+          state.attemptId = state.attemptId
+            .orElse(state.environment.sparkProperties.get("spark.app.attempt.id"))
+        }
+
+      case "SparkListenerJobStart" =>
+        val jobId = int(node, "Job ID").getOrElse(return)
+        val job = state.jobs.getOrElseUpdate(jobId, JobSummary(jobId))
+        job.submissionTime = long(node, "Submission Time").orElse(job.submissionTime)
+        val properties = objectFields(node.get("Properties")).toMap
+        job.description = properties.get("spark.job.description").orElse(job.description)
+        job.jobGroup = properties.get("spark.jobGroup.id").orElse(job.jobGroup)
+        job.sqlExecutionId = properties.get("spark.sql.execution.id").flatMap(parseLong)
+          .orElse(job.sqlExecutionId)
+        job.status = JobExecutionStatus.RUNNING
+
+        val stageKeys = node.get("Stage Infos") match {
+          case stages if stages != null && stages.isArray =>
+            stages.elements().asScala.map { stageInfo =>
+              val stage =
+                updateStageFromInfo(stageInfo, state, Some(StageStatus.PENDING), Some(jobId))
+              stage.key
+            }.toSeq
+          case _ =>
+            Seq.empty
+        }
+        if (stageKeys.nonEmpty) {
+          job.stageKeys = stageKeys
+          job.stageIds = stageKeys.map(_.stageId)
+        } else {
+          job.stageIds = intArray(node.get("Stage IDs"))
+        }
+        if (job.name.isEmpty) {
+          job.name = job.description
+            .orElse(job.stageKeys.headOption.flatMap(key => state.stages.get(key).map(_.name)))
+            .getOrElse(s"Job $jobId")
+        }
+
+      case "SparkListenerJobEnd" =>
+        val jobId = int(node, "Job ID").getOrElse(return)
+        val job = state.jobs.getOrElseUpdate(jobId, JobSummary(jobId))
+        job.completionTime = long(node, "Completion Time").orElse(job.completionTime)
+        val result = Option(node.get("Job Result")).flatMap(text(_, "Result")).getOrElse("")
+        job.status = if (result == "JobSucceeded") {
+          JobExecutionStatus.SUCCEEDED
+        } else if (result.nonEmpty) {
+          JobExecutionStatus.FAILED
+        } else {
+          JobExecutionStatus.UNKNOWN
+        }
+
+      case "SparkListenerStageSubmitted" =>
+        updateStageFromInfo(node.get("Stage Info"), state, Some(StageStatus.ACTIVE), None)
+
+      case "SparkListenerStageCompleted" =>
+        val stage = updateStageFromInfo(node.get("Stage Info"), state, None, None)
+        context.taskBuffer.flush(StageAttemptKey(stage.key.stageId, stage.key.attemptId))
+
+      case _ =>
+    }
+  }
+
+  private def updateStageFromInfo(
+      stageInfo: JsonNode,
+      state: SummaryState,
+      status: Option[StageStatus],
+      jobId: Option[Int]): StageSummary = {
+    val stageId = int(stageInfo, "Stage ID").getOrElse(-1)
+    val attemptId = int(stageInfo, "Stage Attempt ID").getOrElse(0)
+    val key = StageKey(stageId, attemptId)
+    val stage = state.stages.getOrElseUpdate(key, StageSummary(key))
+
+    text(stageInfo, "Stage Name").foreach(stage.name = _)
+    int(stageInfo, "Number of Tasks").foreach(stage.numTasks = _)
+    text(stageInfo, "Details").foreach(stage.details = _)
+    long(stageInfo, "Submission Time").foreach(v => stage.submissionTime = Some(v))
+    long(stageInfo, "Completion Time").foreach(v => stage.completionTime = Some(v))
+    text(stageInfo, "Failure Reason").foreach(v => stage.failureReason = Some(v))
+    int(stageInfo, "Resource Profile Id").foreach(stage.resourceProfileId = _)
+    stage.parentIds = intArray(stageInfo.get("Parent IDs"))
+    stage.rddIds = rddIds(stageInfo.get("RDD Info"))
+    jobId.foreach(id => stage.jobIds += id)
+    status.foreach { s =>
+      if (!stage.isTerminal) {
+        stage.status = s
+      }
+    }
+    if (stage.completionTime.isDefined) {
+      stage.status = stage.failureReason match {
+        case Some(_) => StageStatus.FAILED
+        case None => StageStatus.COMPLETE
+      }
+    }
+    updateMetrics(stage, stageInfo.get("Accumulables"))
+    stage
+  }
+
+  private def updateMetrics(stage: StageSummary, accumulables: JsonNode): Unit = {
+    if (accumulables == null || !accumulables.isArray) return
+
+    accumulables.elements().asScala.foreach { acc =>
+      val value = long(acc, "Value").getOrElse(0L)
+      text(acc, "Name").foreach {
+        case "internal.metrics.executorDeserializeTime" =>
+          stage.metrics.executorDeserializeTime = value
+        case "internal.metrics.executorDeserializeCpuTime" =>
+          stage.metrics.executorDeserializeCpuTime = value
+        case "internal.metrics.executorRunTime" =>
+          stage.metrics.executorRunTime = value
+        case "internal.metrics.executorCpuTime" =>
+          stage.metrics.executorCpuTime = value
+        case "internal.metrics.resultSize" =>
+          stage.metrics.resultSize = value
+        case "internal.metrics.jvmGCTime" =>
+          stage.metrics.jvmGcTime = value
+        case "internal.metrics.resultSerializationTime" =>
+          stage.metrics.resultSerializationTime = value
+        case "internal.metrics.memoryBytesSpilled" =>
+          stage.metrics.memoryBytesSpilled = value
+        case "internal.metrics.diskBytesSpilled" =>
+          stage.metrics.diskBytesSpilled = value
+        case "internal.metrics.peakExecutionMemory" =>
+          stage.metrics.peakExecutionMemory = value
+        case "internal.metrics.input.bytesRead" =>
+          stage.metrics.inputBytes = value
+        case "internal.metrics.input.recordsRead" =>
+          stage.metrics.inputRecords = value
+        case "internal.metrics.output.bytesWritten" =>
+          stage.metrics.outputBytes = value
+        case "internal.metrics.output.recordsWritten" =>
+          stage.metrics.outputRecords = value
+        case "internal.metrics.shuffle.read.remoteBlocksFetched" =>
+          stage.metrics.shuffleRemoteBlocksFetched = value
+        case "internal.metrics.shuffle.read.localBlocksFetched" =>
+          stage.metrics.shuffleLocalBlocksFetched = value
+        case "internal.metrics.shuffle.read.fetchWaitTime" =>
+          stage.metrics.shuffleFetchWaitTime = value
+        case "internal.metrics.shuffle.read.remoteBytesRead" =>
+          stage.metrics.shuffleRemoteBytesRead = value
+        case "internal.metrics.shuffle.read.remoteBytesReadToDisk" =>
+          stage.metrics.shuffleRemoteBytesReadToDisk = value
+        case "internal.metrics.shuffle.read.localBytesRead" =>
+          stage.metrics.shuffleLocalBytesRead = value
+        case "internal.metrics.shuffle.read.recordsRead" =>
+          stage.metrics.shuffleReadRecords = value
+        case "internal.metrics.shuffle.write.bytesWritten" =>
+          stage.metrics.shuffleWriteBytes = value
+        case "internal.metrics.shuffle.write.writeTime" =>
+          stage.metrics.shuffleWriteTime = value
+        case "internal.metrics.shuffle.write.recordsWritten" =>
+          stage.metrics.shuffleWriteRecords = value
+        case _ =>
+      }
+    }
+  }
+
+  private def toTaskDataWrapper(
+      node: JsonNode,
+      stageId: Int,
+      stageAttemptId: Int): Option[org.apache.spark.status.TaskDataWrapper] = {
+    val taskInfo = node.get("Task Info")
+    if (taskInfo == null || !taskInfo.isObject) return None
+
+    val taskId = long(taskInfo, "Task ID").getOrElse(return None)
+    val index = int(taskInfo, "Index").getOrElse(0)
+    val attempt = int(taskInfo, "Attempt").getOrElse(1)
+    val partitionId = int(taskInfo, "Partition ID").getOrElse(-1)
+    val launchTime = long(taskInfo, "Launch Time").getOrElse(0L)
+    val finishTime = long(taskInfo, "Finish Time").getOrElse(launchTime)
+    val gettingResultTime = long(taskInfo, "Getting Result Time").filter(_ > 0).getOrElse(0L)
+    val duration = math.max(0L, finishTime - launchTime)
+    val endReason = node.get("Task End Reason")
+    val status = taskStatus(taskInfo, endReason)
+    val errorMessage = if (status == "SUCCESS") None else taskErrorMessage(endReason)
+    val metrics = node.get("Task Metrics")
+    val hasMetrics = metrics != null && metrics.isObject
+
+    Some(new org.apache.spark.status.TaskDataWrapper(
+      taskId = java.lang.Long.valueOf(taskId),
+      index = index,
+      attempt = attempt,
+      partitionId = partitionId,
+      launchTime = launchTime,
+      resultFetchStart = gettingResultTime,
+      duration = duration,
+      executorId = text(taskInfo, "Executor ID").getOrElse(""),
+      host = text(taskInfo, "Host").getOrElse(""),
+      status = status,
+      taskLocality = text(taskInfo, "Locality").getOrElse("UNKNOWN"),
+      speculative = boolean(taskInfo, "Speculative").getOrElse(false),
+      accumulatorUpdates = taskAccumulatorUpdates(taskInfo),
+      errorMessage = errorMessage,
+      hasMetrics = hasMetrics,
+      executorDeserializeTime = taskMetric(metrics, status, "Executor Deserialize Time"),
+      executorDeserializeCpuTime = taskMetric(metrics, status, "Executor Deserialize CPU Time"),
+      executorRunTime = taskMetric(metrics, status, "Executor Run Time"),
+      executorCpuTime = taskMetric(metrics, status, "Executor CPU Time"),
+      resultSize = taskMetric(metrics, status, "Result Size"),
+      jvmGcTime = taskMetric(metrics, status, "JVM GC Time"),
+      resultSerializationTime = taskMetric(metrics, status, "Result Serialization Time"),
+      memoryBytesSpilled = taskMetric(metrics, status, "Memory Bytes Spilled"),
+      diskBytesSpilled = taskMetric(metrics, status, "Disk Bytes Spilled"),
+      peakExecutionMemory = taskMetric(metrics, status, "Peak Execution Memory"),
+      inputBytesRead = nestedTaskMetric(metrics, status, "Input Metrics", "Bytes Read"),
+      inputRecordsRead = nestedTaskMetric(metrics, status, "Input Metrics", "Records Read"),
+      outputBytesWritten = nestedTaskMetric(metrics, status, "Output Metrics", "Bytes Written"),
+      outputRecordsWritten = nestedTaskMetric(metrics, status, "Output Metrics", "Records Written"),
+      shuffleRemoteBlocksFetched = nestedTaskMetric(
+        metrics, status, "Shuffle Read Metrics", "Remote Blocks Fetched"),
+      shuffleLocalBlocksFetched = nestedTaskMetric(
+        metrics, status, "Shuffle Read Metrics", "Local Blocks Fetched"),
+      shuffleFetchWaitTime = nestedTaskMetric(
+        metrics, status, "Shuffle Read Metrics", "Fetch Wait Time"),
+      shuffleRemoteBytesRead = nestedTaskMetric(
+        metrics, status, "Shuffle Read Metrics", "Remote Bytes Read"),
+      shuffleRemoteBytesReadToDisk = nestedTaskMetric(
+        metrics, status, "Shuffle Read Metrics", "Remote Bytes Read To Disk"),
+      shuffleLocalBytesRead = nestedTaskMetric(
+        metrics, status, "Shuffle Read Metrics", "Local Bytes Read"),
+      shuffleRecordsRead = nestedTaskMetric(
+        metrics, status, "Shuffle Read Metrics", "Total Records Read"),
+      shuffleBytesWritten = nestedTaskMetric(
+        metrics, status, "Shuffle Write Metrics", "Shuffle Bytes Written"),
+      shuffleWriteTime = nestedTaskMetric(
+        metrics, status, "Shuffle Write Metrics", "Shuffle Write Time"),
+      shuffleRecordsWritten = nestedTaskMetric(
+        metrics, status, "Shuffle Write Metrics", "Shuffle Records Written"),
+      stageId = stageId,
+      stageAttemptId = stageAttemptId))
+  }
+
+  private def taskErrorMessage(endReason: JsonNode): Option[String] = {
+    if (endReason == null || !endReason.isObject) return None
+    Seq("Full Stack Trace", "Description", "Kill Reason", "Loss Reason", "Message", "Reason")
+      .iterator
+      .flatMap(field => text(endReason, field))
+      .find(_.nonEmpty)
+  }
+
+  private def taskStatus(taskInfo: JsonNode, endReason: JsonNode): String = {
+    val reason = Option(endReason).flatMap(text(_, "Reason")).getOrElse("")
+    if (boolean(taskInfo, "Killed").contains(true) || reason.contains("TaskKilled")) {
+      "KILLED"
+    } else if (boolean(taskInfo, "Failed").contains(true) ||
+        (reason.nonEmpty && reason != "Success")) {
+      "FAILED"
+    } else if (long(taskInfo, "Finish Time").exists(_ > 0L)) {
+      "SUCCESS"
+    } else {
+      "RUNNING"
+    }
+  }
+
+  private def taskMetric(metrics: JsonNode, status: String, field: String): Long = {
+    val value = if (metrics == null || !metrics.isObject) {
+      None
+    } else {
+      Some(long(metrics, field).getOrElse(0L))
+    }
+    encodeTaskMetric(value, status)
+  }
+
+  private def nestedTaskMetric(
+      metrics: JsonNode,
+      status: String,
+      objectField: String,
+      field: String): Long = {
+    val value = if (metrics == null || !metrics.isObject) {
+      None
+    } else {
+      val nested = metrics.get(objectField)
+      if (nested == null || !nested.isObject) {
+        Some(0L)
+      } else {
+        Some(long(nested, field).getOrElse(0L))
+      }
+    }
+    encodeTaskMetric(value, status)
+  }
+
+  private def encodeTaskMetric(value: Option[Long], status: String): Long = {
+    value match {
+      case Some(metric) if status == "SUCCESS" => metric
+      case Some(metric) => -metric - 1L
+      case None => -1L
+    }
+  }
+
+  private def taskAccumulatorUpdates(taskInfo: JsonNode): Seq[AccumulableInfo] = {
+    val accumulables = taskInfo.get("Accumulables")
+    if (accumulables == null || !accumulables.isArray) {
+      Seq.empty
+    } else {
+      accumulables.elements().asScala.flatMap(toTaskAccumulatorUpdate).toSeq
+    }
+  }
+
+  private def toTaskAccumulatorUpdate(acc: JsonNode): Option[AccumulableInfo] = {
+    if (boolean(acc, "Internal").contains(true) ||
+        text(acc, "Metadata").contains(SqlAccumulatorMetadata)) {
+      None
+    } else {
+      long(acc, "ID").map { id =>
+        new AccumulableInfo(
+          id = id,
+          name = text(acc, "Name").orNull,
+          update = jsonValue(acc.get("Update")),
+          value = jsonValue(acc.get("Value")).orNull)
+      }
+    }
+  }
+
+  private def jsonValue(node: JsonNode): Option[String] = {
+    if (node == null || node.isNull) {
+      None
+    } else if (node.isTextual) {
+      Some(node.asText())
+    } else {
+      Some(node.toString)
+    }
+  }
+
+  private def sparkPlanInfo(node: JsonNode): Option[SparkPlanInfo] = {
+    if (node == null || !node.isObject) {
+      None
+    } else {
+      val children = node.get("children") match {
+        case values if values != null && values.isArray =>
+          values.elements().asScala.flatMap(sparkPlanInfo).toSeq
+        case _ =>
+          Seq.empty
+      }
+      val metrics = node.get("metrics") match {
+        case values if values != null && values.isArray =>
+          values.elements().asScala.flatMap(sqlMetricInfo).toSeq
+        case _ =>
+          Seq.empty
+      }
+      Some(new SparkPlanInfo(
+        nodeName = text(node, "nodeName").getOrElse("Unknown"),
+        simpleString = text(node, "simpleString").getOrElse(""),
+        children = children,
+        metadata = objectFields(node.get("metadata")).toMap,
+        metrics = metrics))
+    }
+  }
+
+  private def sqlMetricInfo(node: JsonNode): Option[SQLMetricInfo] = {
+    if (node == null || !node.isObject) {
+      None
+    } else {
+      long(node, "accumulatorId").map { accumulatorId =>
+        new SQLMetricInfo(
+          name = text(node, "name").getOrElse(""),
+          accumulatorId = accumulatorId,
+          metricType = text(node, "metricType").getOrElse("sum"))
+      }
+    }
+  }
+
+  private def toStoredSqlNodes(nodes: Seq[SparkPlanGraphNode]): Seq[SparkPlanGraphNodeWrapper] = {
+    nodes.map {
+      case cluster: SparkPlanGraphCluster =>
+        val storedCluster = new SparkPlanGraphClusterWrapper(
+          cluster.id,
+          cluster.name,
+          cluster.desc,
+          toStoredSqlNodes(cluster.nodes.toSeq),
+          cluster.metrics)
+        new SparkPlanGraphNodeWrapper(null, storedCluster)
+      case node =>
+        new SparkPlanGraphNodeWrapper(node, null)
+    }
+  }
+
+  private def writeSummaryShards(
+      writer: UIMetaV2Writer,
+      summary: Summary,
+      attemptId: Option[String]): Unit = {
+    val appRecords: Seq[(String, AnyRef)] = Seq(
+      classOf[org.apache.spark.status.ApplicationInfoWrapper].getName ->
+        new org.apache.spark.status.ApplicationInfoWrapper(toApplicationInfo(summary, attemptId)),
+      classOf[org.apache.spark.status.ApplicationEnvironmentInfoWrapper].getName ->
+        new org.apache.spark.status.ApplicationEnvironmentInfoWrapper(
+          toEnvironmentInfo(summary.environment)),
+      classOf[org.apache.spark.status.AppSummary].getName ->
+        new org.apache.spark.status.AppSummary(
+          summary.jobs.count(_.status == JobExecutionStatus.SUCCEEDED),
+          summary.stages.count(_.status == StageStatus.COMPLETE)))
+    writer.writeShard("app-00000", "app", None, None, appRecords)
+
+    val stageRecords = summary.stages
+      .sortBy(s => (s.key.stageId, s.key.attemptId))
+      .iterator
+      .flatMap { stage =>
+        Iterator[(String, AnyRef)](
+          classOf[org.apache.spark.status.StageDataWrapper].getName ->
+            new org.apache.spark.status.StageDataWrapper(
+              toStageData(stage),
+              stage.jobIds.toSet,
+              Map.empty),
+          classOf[org.apache.spark.status.RDDOperationGraphWrapper].getName ->
+            new org.apache.spark.status.RDDOperationGraphWrapper(
+              stage.key.stageId,
+              Seq.empty[RDDOperationEdge],
+              Seq.empty[RDDOperationEdge],
+              Seq.empty[RDDOperationEdge],
+              new org.apache.spark.status.RDDOperationClusterWrapper(
+                s"stage-${stage.key.stageId}",
+                stage.name,
+                Seq.empty,
+                Seq.empty))
+        )
+      }
+    writer.writeShard("stages-00000", "stages", None, None, stageRecords)
+
+    val stageMap = summary.stages.map(stage => stage.key -> stage).toMap
+    val jobRecords = summary.jobs.sortBy(_.jobId).iterator.map { job =>
+      classOf[org.apache.spark.status.JobDataWrapper].getName ->
+        new org.apache.spark.status.JobDataWrapper(
+          toJobData(job, summary, stageMap),
+          Set.empty,
+          job.sqlExecutionId)
+    }
+    writer.writeShard("jobs-00000", "jobs", None, None, jobRecords)
+
+    val sqlRecords = summary.sqlExecutions
+      .sortBy(_.executionId)
+      .flatMap(sqlRecordsFor(summary, _))
+    if (sqlRecords.nonEmpty) {
+      writer.writeShard("sql-00000", "sql", None, None, sqlRecords)
+    }
+  }
+
+  private def sqlRecordsFor(
+      summary: Summary,
+      execution: SQLExecutionSummary): Seq[(String, AnyRef)] = {
+    execution.graph.toSeq.flatMap { graph =>
+      val jobs = summary.jobs
+        .filter(_.sqlExecutionId.contains(execution.executionId))
+      val jobStatuses = jobs.map(job => job.jobId -> job.status).toMap
+      val stages = jobs.flatMap(_.stageIds).toSet
+      Seq[(String, AnyRef)](
+        classOf[SQLExecutionUIData].getName -> new SQLExecutionUIData(
+          executionId = execution.executionId,
+          description = execution.description,
+          details = execution.details,
+          physicalPlanDescription = execution.physicalPlanDescription,
+          modifiedConfigs = execution.modifiedConfigs,
+          metrics = execution.metrics,
+          submissionTime = execution.submissionTime,
+          completionTime = execution.completionTime,
+          jobs = jobStatuses,
+          stages = stages,
+          metricValues = Map.empty[Long, String]),
+        classOf[SparkPlanGraphWrapper].getName -> graph)
+    }
+  }
+
+  private def toApplicationInfo(summary: Summary, attemptId: Option[String]): ApplicationInfo = {
+    val start = new Date(summary.startTime)
+    val end = summary.endTime.map(new Date(_)).getOrElse(new Date(-1L))
+    val duration = summary.endTime.map(t => math.max(0L, t - summary.startTime)).getOrElse(0L)
+    val attempt = ApplicationAttemptInfo(
+      attemptId = attemptId,
+      startTime = start,
+      endTime = end,
+      lastUpdated = summary.endTime.map(new Date(_)).getOrElse(start),
+      duration = duration,
+      sparkUser = summary.user,
+      completed = summary.completed,
+      appSparkVersion = org.apache.spark.SPARK_VERSION)
+
+    ApplicationInfo(
+      id = summary.appId,
+      name = summary.appName,
+      coresGranted = None,
+      maxCores = summary.environment.sparkProperties.get("spark.cores.max").flatMap(parseInt),
+      coresPerExecutor = summary.environment.sparkProperties.get("spark.executor.cores").flatMap(parseInt),
+      memoryPerExecutorMB = summary.environment.sparkProperties.get("spark.executor.memory")
+        .flatMap(parseMemoryMb),
+      attempts = Seq(attempt))
+  }
+
+  private def toEnvironmentInfo(environment: EnvironmentSummary): ApplicationEnvironmentInfo = {
+    new ApplicationEnvironmentInfo(
+      new RuntimeInfo(environment.javaVersion, environment.javaHome, environment.scalaVersion),
+      environment.sparkProperties.toSeq,
+      environment.hadoopProperties.toSeq,
+      environment.systemProperties.toSeq,
+      environment.classpathEntries.toSeq,
+      Seq.empty)
+  }
+
+  private def toJobData(
+      job: JobSummary,
+      summary: Summary,
+      stageMap: Map[StageKey, StageSummary]): JobData = {
+    val stages = job.stageKeys.flatMap(stageMap.get)
+    val numTasks = stages.map(_.numTasks).sum
+    val completedStages = stages.count(_.status == StageStatus.COMPLETE)
+    val failedStages = stages.count(_.status == StageStatus.FAILED)
+    val skippedStages = if (job.status == JobExecutionStatus.SUCCEEDED) {
+      math.max(0, job.stageIds.size - completedStages)
+    } else {
+      0
+    }
+    val completedTasks = if (job.status == JobExecutionStatus.SUCCEEDED) {
+      numTasks
+    } else {
+      stages.filter(_.status == StageStatus.COMPLETE).map(_.numTasks).sum
+    }
+    val failedTasks = stages.filter(_.status == StageStatus.FAILED).map(_.numTasks).sum
+    val activeStages = if (job.status == JobExecutionStatus.RUNNING) {
+      stages.count(s => s.status == StageStatus.ACTIVE || s.status == StageStatus.PENDING)
+    } else {
+      0
+    }
+
+    new JobData(
+      jobId = job.jobId,
+      name = if (job.name.nonEmpty) job.name else s"Job ${job.jobId}",
+      description = job.description,
+      submissionTime = job.submissionTime.map(new Date(_)),
+      completionTime = job.completionTime.map(new Date(_)),
+      stageIds = job.stageIds,
+      jobGroup = job.jobGroup,
+      status = job.status,
+      numTasks = numTasks,
+      numActiveTasks = if (job.status == JobExecutionStatus.RUNNING) {
+        math.max(0, numTasks - completedTasks)
+      } else {
+        0
+      },
+      numCompletedTasks = completedTasks,
+      numSkippedTasks = stages.filter(_.status == StageStatus.SKIPPED).map(_.numTasks).sum,
+      numFailedTasks = failedTasks,
+      numKilledTasks = 0,
+      numCompletedIndices = completedTasks,
+      numActiveStages = activeStages,
+      numCompletedStages = completedStages,
+      numSkippedStages = skippedStages,
+      numFailedStages = failedStages,
+      killedTasksSummary = Map.empty)
+  }
+
+  private def toStageData(stage: StageSummary): StageData = {
+    val metrics = stage.metrics
+    val completedTasks = if (stage.status == StageStatus.COMPLETE) stage.numTasks else 0
+    val failedTasks = if (stage.status == StageStatus.FAILED) stage.numTasks else 0
+    val activeTasks = if (stage.status == StageStatus.ACTIVE) stage.numTasks else 0
+    new StageData(
+      status = stage.status,
+      stageId = stage.key.stageId,
+      attemptId = stage.key.attemptId,
+      numTasks = stage.numTasks,
+      numActiveTasks = activeTasks,
+      numCompleteTasks = completedTasks,
+      numFailedTasks = failedTasks,
+      numKilledTasks = 0,
+      numCompletedIndices = completedTasks,
+      submissionTime = stage.submissionTime.map(new Date(_)),
+      firstTaskLaunchedTime = None,
+      completionTime = stage.completionTime.map(new Date(_)),
+      failureReason = stage.failureReason,
+      executorDeserializeTime = metrics.executorDeserializeTime,
+      executorDeserializeCpuTime = metrics.executorDeserializeCpuTime,
+      executorRunTime = metrics.executorRunTime,
+      executorCpuTime = metrics.executorCpuTime,
+      resultSize = metrics.resultSize,
+      jvmGcTime = metrics.jvmGcTime,
+      resultSerializationTime = metrics.resultSerializationTime,
+      memoryBytesSpilled = metrics.memoryBytesSpilled,
+      diskBytesSpilled = metrics.diskBytesSpilled,
+      peakExecutionMemory = metrics.peakExecutionMemory,
+      inputBytes = metrics.inputBytes,
+      inputRecords = metrics.inputRecords,
+      outputBytes = metrics.outputBytes,
+      outputRecords = metrics.outputRecords,
+      shuffleRemoteBlocksFetched = metrics.shuffleRemoteBlocksFetched,
+      shuffleLocalBlocksFetched = metrics.shuffleLocalBlocksFetched,
+      shuffleFetchWaitTime = metrics.shuffleFetchWaitTime,
+      shuffleRemoteBytesRead = metrics.shuffleRemoteBytesRead,
+      shuffleRemoteBytesReadToDisk = metrics.shuffleRemoteBytesReadToDisk,
+      shuffleLocalBytesRead = metrics.shuffleLocalBytesRead,
+      shuffleReadBytes = metrics.shuffleRemoteBytesRead + metrics.shuffleLocalBytesRead,
+      shuffleReadRecords = metrics.shuffleReadRecords,
+      shuffleWriteBytes = metrics.shuffleWriteBytes,
+      shuffleWriteTime = metrics.shuffleWriteTime,
+      shuffleWriteRecords = metrics.shuffleWriteRecords,
+      name = stage.name,
+      description = None,
+      details = stage.details,
+      schedulingPool = "default",
+      rddIds = stage.rddIds,
+      accumulatorUpdates = Seq.empty,
+      tasks = None,
+      executorSummary = None,
+      speculationSummary = None,
+      killedTasksSummary = Map.empty,
+      resourceProfileId = stage.resourceProfileId,
+      peakExecutorMetrics = None,
+      taskMetricsDistributions = None,
+      executorMetricsDistributions = None)
+  }
+
+  private def eventName(line: String): Option[String] = {
+    val marker = "\"Event\""
+    val markerIndex = line.indexOf(marker)
+    if (markerIndex < 0) return None
+    val colonIndex = line.indexOf(':', markerIndex + marker.length)
+    if (colonIndex < 0) return None
+    val startQuote = line.indexOf('"', colonIndex + 1)
+    if (startQuote < 0) return None
+    val endQuote = line.indexOf('"', startQuote + 1)
+    if (endQuote < 0) return None
+    Some(line.substring(startQuote + 1, endQuote))
+  }
+
+  private def text(node: JsonNode, field: String): Option[String] = {
+    if (node == null) return None
+    val value = node.get(field)
+    if (value == null || value.isNull) None else Some(value.asText())
+  }
+
+  private def long(node: JsonNode, field: String): Option[Long] = {
+    if (node == null) return None
+    val value = node.get(field)
+    if (value == null || value.isNull) None
+    else if (value.isNumber) Some(value.asLong())
+    else parseLong(value.asText())
+  }
+
+  private def int(node: JsonNode, field: String): Option[Int] = {
+    long(node, field).map(_.toInt)
+  }
+
+  private def boolean(node: JsonNode, field: String): Option[Boolean] = {
+    if (node == null) return None
+    val value = node.get(field)
+    if (value == null || value.isNull) None
+    else if (value.isBoolean) Some(value.asBoolean())
+    else parseBoolean(value.asText())
+  }
+
+  private def parseBoolean(value: String): Option[Boolean] = {
+    value.toLowerCase(java.util.Locale.ROOT) match {
+      case "true" => Some(true)
+      case "false" => Some(false)
+      case _ => None
+    }
+  }
+
+  private def parseLong(value: String): Option[Long] = {
+    try {
+      Some(value.toLong)
+    } catch {
+      case _: NumberFormatException => None
+    }
+  }
+
+  private def parseInt(value: String): Option[Int] = {
+    try {
+      Some(value.toInt)
+    } catch {
+      case _: NumberFormatException => None
+    }
+  }
+
+  private def parseMemoryMb(value: String): Option[Int] = {
+    val lower = value.trim.toLowerCase
+    val Pattern = """^(\d+)([kmgt]?)b?$""".r
+    lower match {
+      case Pattern(amount, unit) =>
+        val base = amount.toLong
+        val mb = unit match {
+          case "k" => math.max(1L, base / 1024L)
+          case "" | "m" => base
+          case "g" => base * 1024L
+          case "t" => base * 1024L * 1024L
+        }
+        Some(math.min(Int.MaxValue.toLong, mb).toInt)
+      case _ =>
+        None
+    }
+  }
+
+  private def objectFields(node: JsonNode): Seq[(String, String)] = {
+    if (node == null || !node.isObject) {
+      Seq.empty
+    } else {
+      node.fields().asScala.map { entry =>
+        entry.getKey -> entry.getValue.asText()
+      }.toSeq
+    }
+  }
+
+  private def intArray(node: JsonNode): Seq[Int] = {
+    if (node == null || !node.isArray) {
+      Seq.empty
+    } else {
+      node.elements().asScala.flatMap { item =>
+        if (item.isNumber) Some(item.asInt()) else parseLong(item.asText()).map(_.toInt)
+      }.toSeq
+    }
+  }
+
+  private def rddIds(node: JsonNode): Seq[Int] = {
+    if (node == null || !node.isArray) {
+      Seq.empty
+    } else {
+      node.elements().asScala.flatMap(rdd => int(rdd, "RDD ID")).toSeq
+    }
+  }
+
+  private def inferAppId(path: Path): String = {
+    path.getName.stripSuffix(".inprogress")
+  }
+
+  private def isInProgressPath(path: Path): Boolean = {
+    path.getName.endsWith(".inprogress")
+  }
+
+  private case class ParsedEventLog(
+      summary: Summary,
+      writerOpt: Option[UIMetaV2Writer],
+      totalTasks: Long,
+      newWriter: (String, Option[String], Boolean) => UIMetaV2Writer) {
+
+    def writerFor(summary: Summary, attemptId: Option[String]): UIMetaV2Writer = {
+      writerOpt.getOrElse(newWriter(summary.appId, attemptId, summary.completed))
+    }
+  }
+
+  private class ParseContext(
+      val state: SummaryState,
+      eventLog: String,
+      uimetaDir: String,
+      attemptIdOverride: Option[String],
+      compression: String,
+      taskShardRecords: Int,
+      hadoopConf: Configuration) {
+    private var writer: Option[UIMetaV2Writer] = None
+    val taskBuffer = new TaskShardBuffer(() => ensureWriter(), taskShardRecords)
+
+    def writerOpt: Option[UIMetaV2Writer] = writer
+
+    def totalTasks: Long = taskBuffer.totalTasks
+
+    def flushTasks(): Unit = taskBuffer.flushAll()
+
+    def newWriter(
+        appId: String,
+        attemptId: Option[String],
+        completed: Boolean): UIMetaV2Writer = {
+      new UIMetaV2Writer(
+        logDir = uimetaDir,
+        appId = appId,
+        attemptId = attemptId,
+        completed = completed,
+        sparkVersion = org.apache.spark.SPARK_VERSION,
+        sourceEventLog = eventLog,
+        compression = compression,
+        hadoopConf = hadoopConf)
+    }
+
+    private def ensureWriter(): UIMetaV2Writer = {
+      writer.getOrElse {
+        val attemptId = attemptIdOverride.orElse(state.attemptId)
+        if (!state.authoritativeAppIdSeen) {
+          throw new IllegalStateException(
+            "Cannot write task shards before application metadata is available")
+        }
+        val created = newWriter(state.currentAppId, attemptId, completed = false)
+        state.pathMetadataFrozen = true
+        writer = Some(created)
+        created
+      }
+    }
+  }
+
+  private case class StageAttemptKey(stageId: Int, attemptId: Int)
+
+  private class TaskShardBuffer(
+      writer: () => UIMetaV2Writer,
+      maxRecords: Int) {
+    private val buffers = mutable.HashMap.empty[
+      StageAttemptKey,
+      mutable.ArrayBuffer[org.apache.spark.status.TaskDataWrapper]]
+    private val shardIndexes = mutable.HashMap.empty[StageAttemptKey, Int]
+    var totalTasks: Long = 0L
+
+    def append(
+        key: StageAttemptKey,
+        task: org.apache.spark.status.TaskDataWrapper): Unit = {
+      val buffer = buffers.getOrElseUpdate(
+        key,
+        mutable.ArrayBuffer.empty[org.apache.spark.status.TaskDataWrapper])
+      buffer += task
+      totalTasks += 1L
+      if (buffer.size >= maxRecords) {
+        flush(key)
+      }
+    }
+
+    def flushAll(): Unit = buffers.keys.toSeq.foreach(flush)
+
+    def flush(key: StageAttemptKey): Unit = {
+      buffers.get(key).foreach { buffer =>
+        if (buffer.nonEmpty) {
+          val shardIndex = shardIndexes.getOrElse(key, 0)
+          val id = f"tasks-stage-${key.stageId}%06d-attempt-${key.attemptId}%06d-$shardIndex%05d"
+          writer().writeShard(
+            id = id,
+            kind = "tasks",
+            stageId = Some(key.stageId),
+            stageAttemptId = Some(key.attemptId),
+            records = buffer.iterator.map { task =>
+              classOf[org.apache.spark.status.TaskDataWrapper].getName -> task
+            })
+          buffers.remove(key)
+          shardIndexes.update(key, shardIndex + 1)
+        }
+      }
+    }
+  }
+
+  private class SummaryState(defaultAppId: String) {
+    var appId: Option[String] = Some(defaultAppId).filter(_.nonEmpty)
+    var appName: Option[String] = None
+    var attemptId: Option[String] = None
+    var startTime: Option[Long] = None
+    var endTime: Option[Long] = None
+    var user: Option[String] = None
+    var completed: Boolean = false
+    var environment: EnvironmentSummary = EnvironmentSummary.empty
+    var skippedTaskEvents: Long = 0L
+    var truncatedFinalLine: Boolean = false
+    var authoritativeAppIdSeen: Boolean = false
+    var pathMetadataFrozen: Boolean = false
+    val jobs: mutable.LinkedHashMap[Int, JobSummary] = mutable.LinkedHashMap.empty
+    val stages: mutable.LinkedHashMap[StageKey, StageSummary] = mutable.LinkedHashMap.empty
+    val sqlExecutions: mutable.LinkedHashMap[Long, SQLExecutionSummary] =
+      mutable.LinkedHashMap.empty
+    var sqlRetainedExecutions: Int = DefaultSqlRetainedExecutions
+
+    def currentAppId: String = appId.getOrElse(defaultAppId)
+
+    def getOrCreateSqlExecution(executionId: Long): SQLExecutionSummary = {
+      sqlExecutions.getOrElseUpdate(executionId, SQLExecutionSummary(executionId))
+    }
+
+    def pruneSqlExecutions(): Unit = {
+      val maxExecutions = math.max(1, sqlRetainedExecutions)
+      while (sqlExecutions.size > maxExecutions) {
+        val candidate = sqlExecutions.collectFirst {
+          case (executionId, execution) if execution.completionTime.isDefined => executionId
+        }.orElse(sqlExecutions.headOption.map(_._1))
+        candidate match {
+          case Some(executionId) =>
+            sqlExecutions.remove(executionId)
+          case None =>
+            return
+        }
+      }
+    }
+
+    def toSummary(): Summary = {
+      finalizeSucceedingJobs()
+      val finalAppId = currentAppId
+      val finalStartTime = startTime
+        .orElse(environment.sparkProperties.get("spark.app.startTime").flatMap(parseLong))
+        .getOrElse(System.currentTimeMillis())
+      val latestCompletion = jobs.values.flatMap(_.completionTime)
+        .++(stages.values.flatMap(_.completionTime))
+        .toSeq
+        .sorted
+        .lastOption
+      val finalEndTime = endTime.orElse(latestCompletion)
+      val finalCompleted = completed || finalEndTime.isDefined
+      val finalAppName = appName
+        .orElse(environment.sparkProperties.get("spark.app.name"))
+        .getOrElse(finalAppId)
+      val finalUser = user.getOrElse(System.getProperty("user.name", "unknown"))
+
+      Summary(
+        appId = finalAppId,
+        appName = finalAppName,
+        attemptId = attemptId,
+        user = finalUser,
+        startTime = finalStartTime,
+        endTime = finalEndTime,
+        completed = finalCompleted,
+        environment = environment,
+        jobs = jobs.values.toSeq,
+        stages = stages.values.toSeq,
+        sqlExecutions = sqlExecutions.values.toSeq,
+        skippedTaskEvents = skippedTaskEvents)
+    }
+
+    private def finalizeSucceedingJobs(): Unit = {
+      jobs.values.filter(_.status == JobExecutionStatus.SUCCEEDED).foreach { job =>
+        job.stageKeys.foreach { key =>
+          stages.get(key).foreach { stage =>
+            if (!stage.isTerminal) {
+              stage.status = StageStatus.COMPLETE
+              stage.completionTime = job.completionTime.orElse(stage.completionTime)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private case class Summary(
+      appId: String,
+      appName: String,
+      attemptId: Option[String],
+      user: String,
+      startTime: Long,
+      endTime: Option[Long],
+      completed: Boolean,
+      environment: EnvironmentSummary,
+      jobs: Seq[JobSummary],
+      stages: Seq[StageSummary],
+      sqlExecutions: Seq[SQLExecutionSummary],
+      skippedTaskEvents: Long)
+
+  private case class StageKey(stageId: Int, attemptId: Int)
+
+  private case class JobSummary(jobId: Int) {
+    var name: String = ""
+    var description: Option[String] = None
+    var submissionTime: Option[Long] = None
+    var completionTime: Option[Long] = None
+    var stageIds: Seq[Int] = Seq.empty
+    var stageKeys: Seq[StageKey] = Seq.empty
+    var jobGroup: Option[String] = None
+    var status: JobExecutionStatus = JobExecutionStatus.UNKNOWN
+    var sqlExecutionId: Option[Long] = None
+  }
+
+  private case class SQLExecutionSummary(executionId: Long) {
+    var description: String = ""
+    var details: String = ""
+    var physicalPlanDescription: String = ""
+    var modifiedConfigs: Map[String, String] = Map.empty
+    var metrics: Seq[SQLPlanMetric] = Seq.empty
+    var submissionTime: Long = -1L
+    var completionTime: Option[Date] = None
+    var graph: Option[SparkPlanGraphWrapper] = None
+  }
+
+  private case class StageSummary(key: StageKey) {
+    var name: String = s"Stage ${key.stageId}"
+    var numTasks: Int = 0
+    var submissionTime: Option[Long] = None
+    var completionTime: Option[Long] = None
+    var failureReason: Option[String] = None
+    var details: String = ""
+    var parentIds: Seq[Int] = Seq.empty
+    var rddIds: Seq[Int] = Seq.empty
+    var resourceProfileId: Int = 0
+    var status: StageStatus = StageStatus.PENDING
+    var jobIds: mutable.Set[Int] = mutable.LinkedHashSet.empty
+    val metrics: StageMetrics = StageMetrics()
+
+    def isTerminal: Boolean = status == StageStatus.COMPLETE ||
+      status == StageStatus.FAILED ||
+      status == StageStatus.SKIPPED
+  }
+
+  private case class StageMetrics(
+      var executorDeserializeTime: Long = 0L,
+      var executorDeserializeCpuTime: Long = 0L,
+      var executorRunTime: Long = 0L,
+      var executorCpuTime: Long = 0L,
+      var resultSize: Long = 0L,
+      var jvmGcTime: Long = 0L,
+      var resultSerializationTime: Long = 0L,
+      var memoryBytesSpilled: Long = 0L,
+      var diskBytesSpilled: Long = 0L,
+      var peakExecutionMemory: Long = 0L,
+      var inputBytes: Long = 0L,
+      var inputRecords: Long = 0L,
+      var outputBytes: Long = 0L,
+      var outputRecords: Long = 0L,
+      var shuffleRemoteBlocksFetched: Long = 0L,
+      var shuffleLocalBlocksFetched: Long = 0L,
+      var shuffleFetchWaitTime: Long = 0L,
+      var shuffleRemoteBytesRead: Long = 0L,
+      var shuffleRemoteBytesReadToDisk: Long = 0L,
+      var shuffleLocalBytesRead: Long = 0L,
+      var shuffleReadRecords: Long = 0L,
+      var shuffleWriteBytes: Long = 0L,
+      var shuffleWriteTime: Long = 0L,
+      var shuffleWriteRecords: Long = 0L)
+
+  private case class EnvironmentSummary(
+      javaVersion: String,
+      javaHome: String,
+      scalaVersion: String,
+      sparkProperties: Map[String, String],
+      hadoopProperties: Map[String, String],
+      systemProperties: Map[String, String],
+      classpathEntries: Map[String, String])
+
+  private object EnvironmentSummary {
+    def empty: EnvironmentSummary = {
+      EnvironmentSummary(
+        javaVersion = System.getProperty("java.version", "unknown"),
+        javaHome = System.getProperty("java.home", ""),
+        scalaVersion = util.Properties.versionString,
+        sparkProperties = Map.empty,
+        hadoopProperties = Map.empty,
+        systemProperties = Map.empty,
+        classpathEntries = Map.empty)
+    }
+
+    def fromEvent(node: JsonNode): EnvironmentSummary = {
+      val jvm = Option(node.get("JVM Information"))
+      EnvironmentSummary(
+        javaVersion = jvm.flatMap(text(_, "Java Version")).getOrElse(empty.javaVersion),
+        javaHome = jvm.flatMap(text(_, "Java Home")).getOrElse(empty.javaHome),
+        scalaVersion = jvm.flatMap(text(_, "Scala Version")).getOrElse(empty.scalaVersion),
+        sparkProperties = objectFields(node.get("Spark Properties")).toMap,
+        hadoopProperties = objectFields(node.get("Hadoop Properties")).toMap,
+        systemProperties = objectFields(node.get("System Properties")).toMap,
+        classpathEntries = objectFields(node.get("Classpath Entries")).toMap)
+    }
+  }
+}

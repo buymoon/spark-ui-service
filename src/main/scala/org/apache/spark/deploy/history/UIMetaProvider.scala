@@ -2,16 +2,19 @@ package org.apache.spark.deploy.history
 
 import java.io.DataInputStream
 import java.net.URI
+import java.util.ServiceLoader
 import java.util.zip.ZipOutputStream
 
+import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.{SecurityManager, SparkConf}
 import org.apache.spark.internal.Logging
-import org.apache.spark.status.AppStatusStore
+import org.apache.spark.status.AppHistoryServerPlugin
 import org.apache.spark.status.api.v1.{ApplicationInfo => ApiApplicationInfo}
 import org.apache.spark.ui.SparkUI
+import org.apache.spark.util.Utils
 import org.apache.spark.util.kvstore.InMemoryStore
 
 /**
@@ -35,6 +38,16 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
   }
 
   override def getAppUI(appId: String, attemptId: Option[String]): Option[LoadedAppUI] = {
+    val v2Reader = new UIMetaV2Reader(logDir, hadoopConf)
+    v2Reader.findManifest(appId, attemptId).foreach { manifestPath =>
+      try {
+        return loadV2AppUI(appId, attemptId, manifestPath, v2Reader)
+      } catch {
+        case NonFatal(e) =>
+          logError(s"Error loading UIMeta v2 manifest $manifestPath, falling back", e)
+      }
+    }
+
     val metaFileName = attemptId match {
       case Some(id) => s"${appId}_$id.uimeta"
       case None     => s"${appId}_1.uimeta"
@@ -55,7 +68,7 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
           while (elem.isDefined) {
             val (className, data) = elem.get
             try {
-              val clazz = org.apache.spark.util.Utils.classForName(className)
+              val clazz = Utils.classForName(className)
               store.write(UIMetaFile.deserialize(data, clazz))
             } catch {
               case NonFatal(ex) => logWarning(s"Skip class $className: ${ex.getMessage}")
@@ -66,23 +79,8 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
           in.close()
         }
 
-        val appStatusStore = new AppStatusStore(store)
-        val info = appStatusStore.applicationInfo()
-        val appName = info.name
-        val startTime = info.attempts.headOption
-          .map(_.startTime.getTime).getOrElse(System.currentTimeMillis())
-        val sparkVersion = info.attempts.headOption
-          .flatMap(a => Option(a.appSparkVersion)).getOrElse("3.3.0")
-
-        val secMgr = new SecurityManager(conf)
-        val basePath = s"/history/$appId${attemptId.map("/" + _).getOrElse("")}"
-
-        val ui = SparkUI.create(
-          None, appStatusStore, conf, secMgr,
-          appName, basePath, startTime, sparkVersion
-        )
-
-        Some(LoadedAppUI(ui))
+        val appStatusStore = SparkUIServiceCompat.createAppStatusStore(store)
+        Some(LoadedAppUI(createSparkUI(appId, attemptId, appStatusStore)))
       } catch {
         case NonFatal(e) =>
           logError(s"Error loading $metaPath, falling back", e)
@@ -92,6 +90,42 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
       logWarning(s"$metaPath not found, falling back to FsHistoryProvider")
       fallbackProvider.getAppUI(appId, attemptId)
     }
+  }
+
+  private def loadV2AppUI(
+      appId: String,
+      attemptId: Option[String],
+      manifestPath: Path,
+      reader: UIMetaV2Reader): Option[LoadedAppUI] = {
+    logInfo(s"Loading UIMeta v2 from $manifestPath")
+    val store = new InMemoryStore()
+    val manifest = UIMetaV2Manifest.read(manifestPath, hadoopConf)
+    reader.loadShards(manifest, manifest.summaryShards, store)
+    val appStatusStore = SparkUIServiceCompat.createAppStatusStore(
+      new UIMetaShardStore(store, manifest, reader))
+    Some(LoadedAppUI(createSparkUI(appId, attemptId, appStatusStore)))
+  }
+
+  private def createSparkUI(
+      appId: String,
+      attemptId: Option[String],
+      appStatusStore: org.apache.spark.status.AppStatusStore): SparkUI = {
+    val info = appStatusStore.applicationInfo()
+    val appName = info.name
+    val startTime = info.attempts.headOption
+      .map(_.startTime.getTime).getOrElse(System.currentTimeMillis())
+    val sparkVersion = info.attempts.headOption
+      .flatMap(a => Option(a.appSparkVersion)).getOrElse("3.3.0")
+
+    val secMgr = new SecurityManager(conf)
+    val basePath = s"/history/$appId${attemptId.map("/" + _).getOrElse("")}"
+
+    val ui = SparkUI.create(
+      None, appStatusStore, conf, secMgr,
+      appName, basePath, startTime, sparkVersion
+    )
+    loadPlugins().toSeq.sortBy(_.displayOrder).foreach(_.setupUI(ui))
+    ui
   }
 
   override def getConfig(): Map[String, String] =
@@ -119,4 +153,8 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
 
   override def checkUIViewPermissions(
       appId: String, attemptId: Option[String], user: String): Boolean = true
+
+  private def loadPlugins(): Iterable[AppHistoryServerPlugin] = {
+    ServiceLoader.load(classOf[AppHistoryServerPlugin], Utils.getContextOrSparkClassLoader).asScala
+  }
 }

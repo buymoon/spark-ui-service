@@ -22,6 +22,7 @@ import org.apache.spark.internal.Logging
 object UIMetaFile extends Logging {
 
   val MAGIC_NUMBER: Array[Byte] = "UI_S".getBytes(StandardCharsets.UTF_8)
+  val V2_MAGIC_NUMBER: Array[Byte] = "UI2S".getBytes(StandardCharsets.UTF_8)
 
   private val mapper: ObjectMapper = {
     val m = new ObjectMapper()
@@ -30,6 +31,8 @@ object UIMetaFile extends Logging {
   }
 
   def writeHeader(out: DataOutputStream): Unit = out.write(MAGIC_NUMBER)
+
+  def writeV2Header(out: DataOutputStream): Unit = out.write(V2_MAGIC_NUMBER)
 
   def writeElement(out: DataOutputStream, className: String, instance: AnyRef): Unit = {
     val classNameBytes = className.getBytes(StandardCharsets.UTF_8)
@@ -58,11 +61,15 @@ object UIMetaFile extends Logging {
     mapper.readValue(dataBytes, clazz)
   }
 
-  def verifyHeader(in: DataInputStream): Boolean = {
-    val magic = new Array[Byte](MAGIC_NUMBER.length)
+  def verifyHeader(in: DataInputStream): Boolean = verifyHeaderBytes(in, MAGIC_NUMBER)
+
+  def verifyV2Header(in: DataInputStream): Boolean = verifyHeaderBytes(in, V2_MAGIC_NUMBER)
+
+  private def verifyHeaderBytes(in: DataInputStream, expected: Array[Byte]): Boolean = {
+    val magic = new Array[Byte](expected.length)
     try {
       in.readFully(magic)
-      magic.sameElements(MAGIC_NUMBER)
+      magic.sameElements(expected)
     } catch {
       case _: java.io.EOFException => false
     }
