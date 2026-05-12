@@ -100,7 +100,7 @@ class UIMetaProvider(conf: SparkConf) extends ApplicationHistoryProvider with Lo
     logInfo(s"Loading UIMeta v2 from $manifestPath")
     val store = new InMemoryStore()
     val manifest = UIMetaV2Manifest.read(manifestPath, hadoopConf)
-    reader.loadShards(manifest, manifest.summaryShards, store)
+    reader.loadShards(manifest, manifest.appShards, store)
     val appStatusStore = SparkUIServiceCompat.createAppStatusStore(
       new UIMetaShardStore(store, manifest, reader))
     Some(LoadedAppUI(createSparkUI(appId, attemptId, appStatusStore)))

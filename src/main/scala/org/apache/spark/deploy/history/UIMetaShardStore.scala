@@ -4,7 +4,14 @@ import java.util.Collection
 
 import scala.collection.mutable
 
-import org.apache.spark.status.TaskDataWrapper
+import org.apache.spark.status.{
+  ExecutorStageSummaryWrapper,
+  JobDataWrapper,
+  RDDOperationGraphWrapper,
+  StageDataWrapper,
+  TaskDataWrapper
+}
+import org.apache.spark.sql.execution.ui.{SQLExecutionUIData, SparkPlanGraphWrapper}
 import org.apache.spark.util.kvstore.{KVStore, KVStoreIterator, KVStoreView}
 
 private[history] class UIMetaShardStore(
@@ -13,12 +20,20 @@ private[history] class UIMetaShardStore(
     reader: UIMetaV2Reader) extends KVStore {
 
   private val loadedStages = mutable.Set.empty[(Int, Int)]
+  private val loadedKinds = mutable.Set.empty[String]
+
+  private[history] def isKindLoaded(kind: String): Boolean = synchronized {
+    loadedKinds.contains(kind)
+  }
 
   override def getMetadata[T](klass: Class[T]): T = delegate.getMetadata(klass)
 
   override def setMetadata(value: Any): Unit = delegate.setMetadata(value)
 
-  override def read[T](klass: Class[T], naturalKey: Any): T = delegate.read(klass, naturalKey)
+  override def read[T](klass: Class[T], naturalKey: Any): T = {
+    loadKindForClassIfNeeded(klass)
+    delegate.read(klass, naturalKey)
+  }
 
   override def write(value: Any): Unit = delegate.write(value)
 
@@ -30,11 +45,15 @@ private[history] class UIMetaShardStore(
     if (klass == classOf[TaskDataWrapper]) {
       new UIMetaTaskKVStoreView[T](() => delegate.view(klass), loadStageIfNeeded)
     } else {
+      loadKindForClassIfNeeded(klass)
       delegate.view(klass)
     }
   }
 
-  override def count(klass: Class[_]): Long = delegate.count(klass)
+  override def count(klass: Class[_]): Long = {
+    loadKindForClassIfNeeded(klass)
+    delegate.count(klass)
+  }
 
   override def count(klass: Class[_], index: String, indexedValue: Any): Long = {
     if (klass == classOf[TaskDataWrapper]) {
@@ -43,6 +62,8 @@ private[history] class UIMetaShardStore(
           delegate.count(klass) == 0L) {
         return 0L
       }
+    } else {
+      loadKindForClassIfNeeded(klass)
     }
     delegate.count(klass, index, indexedValue)
   }
@@ -55,6 +76,38 @@ private[history] class UIMetaShardStore(
   }
 
   override def close(): Unit = delegate.close()
+
+  private def loadKindForClassIfNeeded(klass: Class[_]): Unit = {
+    shardKindForClass(klass).foreach(loadKindIfNeeded)
+  }
+
+  private def loadKindIfNeeded(kind: String): Unit = synchronized {
+    if (!loadedKinds.contains(kind)) {
+      val shards = manifest.shardsForKind(kind)
+      if (shards.nonEmpty) {
+        reader.loadShards(manifest, shards, delegate)
+      }
+      loadedKinds += kind
+    }
+  }
+
+  private def shardKindForClass(klass: Class[_]): Option[String] = {
+    if (klass == classOf[JobDataWrapper]) {
+      Some("jobs")
+    } else if (
+        klass == classOf[StageDataWrapper] ||
+        klass == classOf[RDDOperationGraphWrapper] ||
+        klass == classOf[ExecutorStageSummaryWrapper]) {
+      Some("stages")
+    } else if (
+        klass == classOf[SQLExecutionUIData] ||
+        klass == classOf[SparkPlanGraphWrapper] ||
+        klass.getName.startsWith("org.apache.spark.sql.execution.ui.")) {
+      Some("sql")
+    } else {
+      None
+    }
+  }
 
   private def loadStageIfNeeded(index: String, value: Any): Boolean = synchronized {
     if (index != "stage") {

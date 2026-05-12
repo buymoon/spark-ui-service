@@ -5,7 +5,7 @@ import java.nio.file.Files
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.spark.SparkConf
-import org.apache.spark.status.{StageDataWrapper, TaskDataWrapper}
+import org.apache.spark.status.{JobDataWrapper, StageDataWrapper, TaskDataWrapper}
 import org.apache.spark.sql.execution.ui.SQLExecutionUIData
 import org.apache.spark.util.kvstore.KVStore
 import org.scalatest.funsuite.AnyFunSuite
@@ -44,7 +44,14 @@ class UIMetaProviderV2Suite extends AnyFunSuite {
       val loaded = provider.getAppUI("local-provider-v2", None)
 
       assert(loaded.isDefined)
-      assert(kvStore(loaded.get.ui.store).count(classOf[StageDataWrapper]) == 1L)
+      val store = kvStore(loaded.get.ui.store).asInstanceOf[UIMetaShardStore]
+      assert(!store.isKindLoaded("jobs"))
+      assert(!store.isKindLoaded("stages"))
+      assert(store.count(classOf[JobDataWrapper]) == 1L)
+      assert(store.isKindLoaded("jobs"))
+      assert(!store.isKindLoaded("stages"))
+      assert(store.count(classOf[StageDataWrapper]) == 1L)
+      assert(store.isKindLoaded("stages"))
       assert(loaded.get.ui.store.taskCount(1, 0) == 0L)
     } finally {
       provider.stop()

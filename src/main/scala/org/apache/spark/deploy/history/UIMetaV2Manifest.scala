@@ -35,7 +35,11 @@ private[history] case class UIMetaV2Manifest(
     counts: UIMetaV2Counts,
     shards: Seq[UIMetaV2Shard]) {
 
+  def appShards: Seq[UIMetaV2Shard] = shardsForKind("app")
+
   def summaryShards: Seq[UIMetaV2Shard] = shards.filterNot(_.kind == "tasks")
+
+  def shardsForKind(kind: String): Seq[UIMetaV2Shard] = shards.filter(_.kind == kind)
 
   def taskShardsFor(stageId: Int, stageAttemptId: Int): Seq[UIMetaV2Shard] = {
     shards.filter { shard =>

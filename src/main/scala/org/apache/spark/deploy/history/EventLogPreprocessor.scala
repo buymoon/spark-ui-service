@@ -34,6 +34,7 @@ object EventLogPreprocessor extends Logging {
     val conf = new SparkConf()
       .setAppName("EventLogPreprocessor")
       .set("spark.uimeta.dir", config.uimetaDir)
+      .set("spark.sql.ui.retainedExecutions", Int.MaxValue.toString)
 
     val hadoopConf = org.apache.spark.deploy.SparkHadoopUtil.get.newConfiguration(conf)
     val result = config.mode match {
