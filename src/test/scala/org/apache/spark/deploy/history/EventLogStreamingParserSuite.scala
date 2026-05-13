@@ -409,6 +409,47 @@ class EventLogStreamingParserSuite extends AnyFunSuite {
     assert(graph.makeDotFile(execution.metricValues).contains("stage 0.0: task 1"))
   }
 
+  test("stream-v2 buffers SQL task metrics until adaptive metric definitions arrive") {
+    val tempDir = Files.createTempDirectory("stream-v2-delayed-sql-metrics")
+    val eventLog = tempDir.resolve("local-delayed-sql-metrics")
+    val uimetaDir = tempDir.resolve("uimeta")
+    Files.createDirectories(uimetaDir)
+
+    val lines = Seq(
+      applicationStart("local-delayed-sql-metrics", "Delayed SQL Metrics", None),
+      sqlExecutionStartJson(99L),
+      s"""{"Event":"SparkListenerJobStart","Job ID":0,"Submission Time":2000,"Stage Infos":[{"Stage ID":0,"Stage Attempt ID":0,"Stage Name":"sql-stage","Number of Tasks":2,"RDD Info":[{"RDD ID":0}],"Parent IDs":[],"Details":"sql-stage details","Submission Time":2000,"Resource Profile Id":0}],"Stage IDs":[0],"Properties":{"spark.job.description":"sql-job","spark.sql.execution.id":"99"}}""",
+      s"""{"Event":"SparkListenerStageSubmitted","Stage Info":{"Stage ID":0,"Stage Attempt ID":0,"Stage Name":"sql-stage","Number of Tasks":2,"RDD Info":[{"RDD ID":0}],"Parent IDs":[],"Details":"sql-stage details","Submission Time":2000,"Accumulables":[],"Resource Profile Id":0},"Properties":{}}""",
+      sqlMetricTaskEndJson(taskId = 0L, index = 0, outputRows = 3L, scanTime = 100L),
+      sqlMetricTaskEndJson(taskId = 1L, index = 1, outputRows = 4L, scanTime = 200L),
+      """{"Event":"org.apache.spark.sql.execution.ui.SparkListenerSQLAdaptiveSQLMetricUpdates","executionId":99,"sqlPlanMetrics":[{"name":"number of output rows","accumulatorId":7,"metricType":"sum"},{"name":"scan time","accumulatorId":8,"metricType":"timing"}]}""",
+      s"""{"Event":"SparkListenerStageCompleted","Stage Info":{"Stage ID":0,"Stage Attempt ID":0,"Stage Name":"sql-stage","Number of Tasks":2,"RDD Info":[{"RDD ID":0}],"Parent IDs":[],"Details":"sql-stage details","Submission Time":2000,"Completion Time":2300,"Accumulables":[],"Resource Profile Id":0}}""",
+      """{"Event":"SparkListenerJobEnd","Job ID":0,"Completion Time":2310,"Job Result":{"Result":"JobSucceeded"}}""",
+      """{"Event":"org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd","executionId":99,"time":2400}""",
+      applicationEnd(2500L)
+    )
+    Files.write(eventLog, lines.mkString("\n").getBytes(StandardCharsets.UTF_8))
+
+    val hadoopConf = new Configuration()
+    val result = EventLogStreamingParser.writeUIMeta(
+      eventLog.toUri.toString,
+      uimetaDir.toUri.toString,
+      None,
+      compression = "none",
+      taskShardRecords = 100000,
+      hadoopConf = hadoopConf)
+
+    val manifest = UIMetaV2Manifest.read(result.uimetaPath, hadoopConf)
+    val store = new InMemoryStore()
+    val reader = new UIMetaV2Reader(uimetaDir.toUri.toString, hadoopConf)
+    reader.loadShards(manifest, manifest.summaryShards, store)
+
+    val execution = store.read(classOf[SQLExecutionUIData], 99L)
+    assert(execution.metricValues(7L) == "7")
+    assert(execution.metricValues(8L) ==
+      SQLMetrics.stringValue("timing", Array(100L, 200L), Array(200L, 0L, 0L, 1L)))
+  }
+
   test("stream-v2 bounds SQL executions from retained executions config") {
     val tempDir = Files.createTempDirectory("stream-v2-sql-retention")
     val eventLog = tempDir.resolve("local-sql-retention")

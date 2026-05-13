@@ -54,6 +54,7 @@ private[history] object EventLogStreamingParser extends Logging {
   private val SqlAccumulatorMetadata = "sql"
   private val SqlRetainedExecutionsConf = "spark.sql.ui.retainedExecutions"
   private val DefaultSqlRetainedExecutions = Int.MaxValue
+  private val DefaultLogProgressInterval = 50000
   private val SummaryShardRecords = 5000
   private val sqlExecutionStartEvents = Set(
     "SparkListenerSQLExecutionStart",
@@ -89,10 +90,15 @@ private[history] object EventLogStreamingParser extends Logging {
       taskShardRecords,
       hadoopConf)
     val summary = parsed.summary
+    logInfo(s"[stream-v2] Parse completed: ${summary.stages.size} stages, " +
+      s"${summary.jobs.size} jobs, ${summary.sqlExecutions.size} SQL executions, " +
+      s"${parsed.totalTasks} total tasks")
     val attemptId = attemptIdOverride.orElse(summary.attemptId)
     val writer = parsed.writerFor(summary, attemptId)
 
+    logInfo(s"[stream-v2] Writing summary shards...")
     writeSummaryShards(writer, summary, attemptId)
+    logInfo(s"[stream-v2] Summary shards written, committing manifest...")
     val metaPath = writer.commit(UIMetaV2Counts(
       jobs = summary.jobs.size,
       stages = summary.stages.size,
@@ -160,12 +166,24 @@ private[history] object EventLogStreamingParser extends Logging {
     val in = EventLogFileReader.openEventLog(path, fs)
     val reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8), 1024 * 1024)
     try {
+      var lineCount = 0L
+      var lastLogLine = 0L
       var line = reader.readLine()
       while (line != null) {
+        lineCount += 1L
         val nextLine = reader.readLine()
         handleLine(line, context, tolerateTruncatedFinalLine && nextLine == null)
+        if (lineCount - lastLogLine >= DefaultLogProgressInterval) {
+          logInfo(s"[stream-v2] Parsed $lineCount lines (tasks=${context.totalTasks}, " +
+            s"stages=${context.state.stages.size}, jobs=${context.state.jobs.size}, " +
+            s"sql=${context.state.sqlExecutions.size})")
+          lastLogLine = lineCount
+        }
         line = nextLine
       }
+      logInfo(s"[stream-v2] Finished parsing: $lineCount lines total (tasks=${context.totalTasks}, " +
+        s"stages=${context.state.stages.size}, jobs=${context.state.jobs.size}, " +
+        s"sql=${context.state.sqlExecutions.size})")
     } finally {
       reader.close()
     }
@@ -256,7 +274,6 @@ private[history] object EventLogStreamingParser extends Logging {
         executionId,
         toStoredSqlNodes(graph.nodes),
         graph.edges))
-      state.refreshSqlStageMetrics(executionId)
       state.pruneSqlExecutions()
     }
   }
@@ -283,7 +300,6 @@ private[history] object EventLogStreamingParser extends Logging {
         executionId,
         toStoredSqlNodes(graph.nodes),
         graph.edges))
-      state.refreshSqlStageMetrics(executionId)
       state.pruneSqlExecutions()
     }
   }
@@ -299,7 +315,6 @@ private[history] object EventLogStreamingParser extends Logging {
     if (metrics.nonEmpty) {
       val execution = state.getOrCreateSqlExecution(executionId)
       execution.metrics = mergeSqlMetrics(execution.metrics, metrics)
-      state.refreshSqlStageMetrics(executionId)
       state.pruneSqlExecutions()
     }
   }
@@ -349,8 +364,7 @@ private[history] object EventLogStreamingParser extends Logging {
         state.environment = EnvironmentSummary.fromEvent(node)
         state.environment.sparkProperties.get(SqlRetainedExecutionsConf)
           .flatMap(parseInt)
-          .filter(_ > state.sqlRetainedExecutions)
-          .foreach { retained => state.sqlRetainedExecutions = retained }
+          .foreach { retained => state.sqlRetainedExecutions = math.max(1, retained) }
         state.pruneSqlExecutions()
         state.environment.sparkProperties.get("spark.app.id").foreach { appId =>
           if (!state.pathMetadataFrozen && !state.authoritativeAppIdSeen) {
@@ -810,9 +824,9 @@ private[history] object EventLogStreamingParser extends Logging {
     val taskId = long(taskInfo, "Task ID").getOrElse(return)
     val index = int(taskInfo, "Index").getOrElse(return)
     val status = taskStatus(taskInfo, node.get("Task End Reason"))
-    state.updateSqlTaskMetrics(
-      StageKey(stageId, attemptId),
+    state.bufferSqlTaskMetrics(
       taskId,
+      StageKey(stageId, attemptId),
       index,
       succeeded = status == "SUCCESS",
       updates)
@@ -1440,8 +1454,6 @@ private[history] object EventLogStreamingParser extends Logging {
       }
     }
 
-    def flushAll(): Unit = buffers.keys.toSeq.foreach(flush)
-
     def flush(key: StageAttemptKey): Unit = {
       buffers.get(key).foreach { buffer =>
         if (buffer.nonEmpty) {
@@ -1452,13 +1464,19 @@ private[history] object EventLogStreamingParser extends Logging {
             kind = "tasks",
             stageId = Some(key.stageId),
             stageAttemptId = Some(key.attemptId),
-            records = buffer.iterator.map { task =>
+            records = buffer.toSeq.map { task =>
               classOf[org.apache.spark.status.TaskDataWrapper].getName -> task
             })
-          buffers.remove(key)
+          buffer.clear()
           shardIndexes.update(key, shardIndex + 1)
         }
       }
+    }
+
+    def flushAll(): Unit = {
+      val remainingKeys = buffers.keys.toSeq
+      remainingKeys.foreach(flush)
+      buffers.clear()
     }
   }
 
@@ -1483,6 +1501,7 @@ private[history] object EventLogStreamingParser extends Logging {
       mutable.HashMap.empty[StageKey, mutable.Set[Long]]
     private val sqlStageMetrics =
       mutable.HashMap.empty[SqlStageMetricKey, SqlStageMetricSummary]
+    private var sqlTaskMetricCount = 0L
     var sqlRetainedExecutions: Int = DefaultSqlRetainedExecutions
 
     def currentAppId: String = appId.getOrElse(defaultAppId)
@@ -1499,46 +1518,30 @@ private[history] object EventLogStreamingParser extends Logging {
         job.stageKeys.foreach { key =>
           sqlStageExecutions.getOrElseUpdate(key, mutable.Set.empty) += executionId
         }
-        refreshSqlStageMetrics(executionId)
       }
     }
 
-    def refreshSqlStageMetrics(executionId: Long): Unit = {
-      sqlExecutions.get(executionId).foreach { execution =>
-        val accumTypes = execution.metrics.map { metric =>
-          metric.accumulatorId -> metric.metricType
-        }.toMap
-        if (accumTypes.nonEmpty) {
-          val stageKeys = jobs.values
-            .filter(_.sqlExecutionId.contains(executionId))
-            .flatMap(_.stageKeys)
-            .toSeq
-            .distinct
-          stageKeys.foreach { key =>
-            sqlStageExecutions.getOrElseUpdate(key, mutable.Set.empty) += executionId
-            val numTasks = stages.get(key).map(_.numTasks).getOrElse(0)
-            val metricKey = SqlStageMetricKey(executionId, key)
-            val metrics = sqlStageMetrics.getOrElseUpdate(
-              metricKey,
-              new SqlStageMetricSummary(key, numTasks, accumTypes))
-            metrics.updateNumTasks(numTasks)
-            metrics.updateAccumulatorTypes(accumTypes)
-          }
-        }
-      }
-    }
-
-    def updateSqlTaskMetrics(
-        key: StageKey,
+    def bufferSqlTaskMetrics(
         taskId: Long,
+        key: StageKey,
         taskIndex: Int,
         succeeded: Boolean,
         updates: Seq[(Long, Long)]): Unit = {
-      sqlStageExecutions.get(key).foreach { executionIds =>
+      sqlTaskMetricCount += 1L
+      val executionIds = sqlStageExecutions.getOrElse(key, mutable.Set.empty[Long])
+      if (executionIds.nonEmpty && updates.nonEmpty) {
         executionIds.foreach { executionId =>
-          refreshSqlStageMetrics(executionId)
-          sqlStageMetrics.get(SqlStageMetricKey(executionId, key)).foreach { metrics =>
-            metrics.updateTaskMetrics(taskId, taskIndex, succeeded, updates)
+          val metricKey = SqlStageMetricKey(executionId, key)
+          val metrics = sqlStageMetrics.getOrElseUpdate(
+            metricKey,
+            new SqlStageMetricSummary(
+              key,
+              stages.get(key).map(_.numTasks).getOrElse(0),
+              Map.empty))
+          metrics.recordMetric(taskId, taskIndex, succeeded, updates)
+          if (sqlTaskMetricCount % 100000 == 0) {
+            logInfo(s"[stream-v2] Buffered $sqlTaskMetricCount SQL task metrics, " +
+              s"sqlStageMetrics size=${sqlStageMetrics.size}")
           }
         }
       }
@@ -1618,58 +1621,71 @@ private[history] object EventLogStreamingParser extends Logging {
     }
 
     private def finalizeSqlMetrics(): Unit = {
+      logInfo(s"[stream-v2] Starting SQL metrics finalization: ${sqlStageMetrics.size} " +
+        s"stage-metric entries, ${sqlStageExecutions.size} stage-execution mappings")
+      val startTime = System.currentTimeMillis()
       sqlExecutions.values.foreach { execution =>
-        execution.metricValues = aggregateSqlMetricValues(execution)
-      }
-    }
-
-    private def aggregateSqlMetricValues(
-        execution: SQLExecutionSummary): Map[Long, String] = {
-      val metricTypes = execution.metrics.map { metric =>
-        metric.accumulatorId -> metric.metricType
-      }.toMap
-      if (metricTypes.isEmpty) return Map.empty
-
-      val allMetrics = mutable.HashMap.empty[Long, Array[Long]]
-      val maxMetrics = mutable.HashMap.empty[Long, Array[Long]]
-
-      sqlStageMetrics.iterator.collect {
-        case (metricKey, metrics) if metricKey.executionId == execution.executionId => metrics
-      }.foreach { metrics =>
-        metrics.metricValues()
-          .filter { case (id, _) => metricTypes.contains(id) }
-          .foreach { case (id, values) =>
-            allMetrics.update(id, allMetrics.get(id).map(_ ++ values).getOrElse(values))
+        if (execution.metrics.nonEmpty) {
+          val accumTypes = execution.metrics.map { metric =>
+            metric.accumulatorId -> metric.metricType
+          }.toMap
+          val relevantMetrics = sqlStageMetrics.iterator.collect {
+            case (metricKey, metrics) if metricKey.executionId == execution.executionId => metrics
+          }.toSeq
+          logInfo(s"[stream-v2] Aggregating metrics for SQL execution ${execution.executionId}: " +
+            s"${relevantMetrics.size} stages, ${accumTypes.size} accumulator types")
+          if (relevantMetrics.nonEmpty) {
+            execution.metricValues = aggregateSqlMetricValuesFromStages(relevantMetrics, accumTypes)
           }
-
-        metrics.maxMetricValues()
-          .filter { case (id, _) =>
-            metricTypes.get(id).exists(SQLMetrics.metricNeedsMax)
-          }
-          .foreach { case (id, values) =>
-            val current = maxMetrics.getOrElse(id, values)
-            if (values(0) > current(0)) {
-              maxMetrics.update(id, values)
-            } else if (!maxMetrics.contains(id)) {
-              maxMetrics.update(id, current)
+          execution.driverAccumUpdates.foreach { case (id, value) =>
+            if (accumTypes.contains(id)) {
+              val current = execution.metricValues.getOrElse(id, "0")
+              execution.metricValues = execution.metricValues.updated(
+                id,
+                try {
+                  (current.toLong + value).toString
+                } catch {
+                  case _: Exception => current
+                })
             }
           }
+        }
       }
+      val elapsed = System.currentTimeMillis() - startTime
+      logInfo(s"[stream-v2] SQL metrics finalization completed in ${elapsed}ms")
+    }
 
-      execution.driverAccumUpdates.foreach { case (id, value) =>
-        if (metricTypes.contains(id)) {
-          allMetrics.update(id, allMetrics.get(id).map(_ :+ value).getOrElse(Array(value)))
-          if (maxMetrics.get(id).exists(values => value > values(0))) {
-            maxMetrics.remove(id)
+    private def aggregateSqlMetricValuesFromStages(
+        stageMetrics: Seq[SqlStageMetricSummary],
+        accumTypes: Map[Long, String]): Map[Long, String] = {
+      val allMetrics = mutable.HashMap.empty[Long, mutable.ArrayBuilder[Long]]
+      val maxMetrics = mutable.HashMap.empty[Long, Array[Long]]
+
+      stageMetrics.foreach { metrics =>
+        metrics.metricValues().foreach { case (id, values) =>
+          if (accumTypes.contains(id)) {
+            val builder = allMetrics.getOrElseUpdate(id, mutable.ArrayBuilder.make[Long])
+            var i = 0
+            while (i < values.length) {
+              if (values(i) != 0L) builder += values(i)
+              i += 1
+            }
+          }
+        }
+        metrics.maxMetricValues().foreach { case (id, values) =>
+          if (accumTypes.contains(id) && SQLMetrics.metricNeedsMax(accumTypes(id))) {
+            val current = maxMetrics.get(id)
+            if (current.forall(existing => values(0) > existing(0))) {
+              maxMetrics.update(id, values.clone())
+            }
           }
         }
       }
 
-      allMetrics.map { case (id, values) =>
-        id -> formatSqlMetricValue(
-          metricTypes(id),
-          values,
-          maxMetrics.getOrElse(id, Array.empty[Long]))
+      allMetrics.map { case (id, builder) =>
+        val values = builder.result()
+        val maxArray = maxMetrics.getOrElse(id, Array.empty[Long])
+        id -> formatSqlMetricValue(accumTypes.getOrElse(id, "sum"), values, maxArray)
       }.toMap
     }
   }
@@ -1770,49 +1786,43 @@ private[history] object EventLogStreamingParser extends Logging {
     private val completedIndices = mutable.Set.empty[Int]
     private val taskMetrics = mutable.HashMap.empty[Long, Array[Long]]
     private val maxTaskValues = mutable.HashMap.empty[Long, Array[Long]]
+    private var metricsRecorded: Long = 0L
 
-    def updateNumTasks(value: Int): Unit = {
-      if (value > numTasks) {
-        numTasks = value
-        taskMetrics.keys.toSeq.foreach { id =>
-          taskMetrics.update(id, grow(taskMetrics(id), numTasks))
-        }
-      }
-    }
-
-    def updateAccumulatorTypes(value: Map[Long, String]): Unit = {
-      accumulatorTypes = accumulatorTypes ++ value
-    }
-
-    def updateTaskMetrics(
+    def recordMetric(
         taskId: Long,
         taskIndex: Int,
         succeeded: Boolean,
         updates: Seq[(Long, Long)]): Unit = {
-      if (taskIndex < 0 || completedIndices.contains(taskIndex)) {
-        return
+      metricsRecorded += 1L
+      if (taskIndex < 0) return
+      if (accumulatorTypes.isEmpty) {
+        accumulatorTypes = updates.map { case (id, _) => id -> "sum" }.toMap
       }
       if (taskIndex >= numTasks) {
-        updateNumTasks(taskIndex + 1)
-      }
-      updates
-        .filter { case (id, _) => accumulatorTypes.contains(id) }
-        .foreach { case (id, value) =>
-          val values = taskMetrics.getOrElseUpdate(id, new Array[Long](numTasks))
-          values(taskIndex) = value
-
-          if (SQLMetrics.metricNeedsMax(accumulatorTypes(id))) {
-            val current = maxTaskValues.getOrElseUpdate(
-              id,
-              Array(value, key.stageId.toLong, key.attemptId.toLong, taskId))
-            if (value > current(0)) {
-              current(0) = value
-              current(1) = key.stageId
-              current(2) = key.attemptId
-              current(3) = taskId
-            }
+        numTasks = taskIndex + 1
+        taskMetrics.keys.toSeq.foreach { id =>
+          val values = taskMetrics(id)
+          if (taskIndex >= values.length) {
+            taskMetrics.update(id, grow(values, numTasks))
           }
         }
+      }
+      updates.foreach { case (id, value) =>
+        accumulatorTypes = accumulatorTypes.updated(id, accumulatorTypes.getOrElse(id, "sum"))
+        val values = taskMetrics.getOrElseUpdate(id, new Array[Long](numTasks))
+        if (taskIndex < values.length) {
+          values(taskIndex) = value
+        }
+        val current = maxTaskValues.getOrElseUpdate(
+          id,
+          Array(value, key.stageId.toLong, key.attemptId.toLong, taskId))
+        if (value > current(0)) {
+          current(0) = value
+          current(1) = key.stageId
+          current(2) = key.attemptId
+          current(3) = taskId
+        }
+      }
       if (succeeded) {
         completedIndices += taskIndex
       }
@@ -1827,9 +1837,8 @@ private[history] object EventLogStreamingParser extends Logging {
     }
 
     private def grow(values: Array[Long], size: Int): Array[Long] = {
-      if (values.length >= size) {
-        values
-      } else {
+      if (values.length >= size) values
+      else {
         val expanded = new Array[Long](size)
         Array.copy(values, 0, expanded, 0, values.length)
         expanded
